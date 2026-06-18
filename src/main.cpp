@@ -17,6 +17,7 @@
 #endif
 
 TFT_eSPI tft;
+TFT_eSprite dogSprite = TFT_eSprite(&tft);
 Preferences prefs;
 WebServer server(80);
 DNSServer dnsServer;
@@ -1106,7 +1107,7 @@ void drawMarketRows()
 
 void drawCo2Values()
 {
-  tft.fillRect(0, 42, SCREEN_W, 100, uiBg());
+  tft.fillRect(96, 42, SCREEN_W - 96, 100, uiBg());
   tft.drawCircle(280, 58, 8, uiSelect());
   tft.drawCircle(294, 82, 12, uiMint());
   tft.setTextDatum(MC_DATUM);
@@ -1148,13 +1149,27 @@ void drawCo2Values()
   tft.setTextDatum(MR_DATUM);
   tft.setTextColor(uiText(), uiBg());
   tft.drawString(lastCo2FrameAt ? String(age) + "s" : String("--"), SCREEN_W - 12, 128, 2);
-  drawCo2DogAvatar();
 }
 
 void drawCo2DogAvatar()
 {
+  static bool spriteReady = false;
+  if (!spriteReady) {
+    dogSprite.setColorDepth(16);
+    dogSprite.createSprite(86, 90);
+    spriteReady = true;
+  }
+
+  uint32_t age = lastCo2FrameAt == 0 ? 999 : (millis() - lastCo2FrameAt) / 1000;
+  int mood = 0;
+  if (co2Ppm < 0 || age > 3) mood = 0;
+  else if (co2Ppm < 800) mood = 1;
+  else if (co2Ppm < 1200) mood = 2;
+  else if (co2Ppm < 2000) mood = 3;
+  else mood = 4;
+
   int frame = (millis() / 360) % 8;
-  bool blink = frame == 0;
+  bool blink = frame == 0 && mood != 4;
   int earWiggle = (frame % 4 == 1) ? -2 : ((frame % 4 == 3) ? 2 : 0);
   int breath = (frame % 4) < 2 ? 0 : 1;
 
@@ -1165,41 +1180,78 @@ void drawCo2DogAvatar()
   uint16_t dark = tft.color565(42, 31, 31);
   uint16_t nose = tft.color565(36, 33, 37);
   uint16_t blush = tft.color565(255, 178, 190);
+  uint16_t sweat = tft.color565(126, 216, 255);
 
-  int x = 43;
-  int y = 93;
-  tft.fillRect(10, 50, 82, 88, uiBg());
+  dogSprite.fillSprite(uiBg());
+  int x = 34;
+  int y = 43;
 
-  tft.fillTriangle(x - 24, y - 20, x - 8, y - 54 + earWiggle, x - 2, y - 15, tan);
-  tft.fillTriangle(x - 18, y - 22, x - 8, y - 44 + earWiggle, x - 6, y - 17, cream);
-  tft.drawLine(x - 23, y - 20, x - 8, y - 54 + earWiggle, shadow);
+  dogSprite.fillTriangle(x - 24, y - 20, x - 8, y - 54 + earWiggle, x - 2, y - 15, tan);
+  dogSprite.fillTriangle(x - 18, y - 22, x - 8, y - 44 + earWiggle, x - 6, y - 17, cream);
+  dogSprite.drawLine(x - 23, y - 20, x - 8, y - 54 + earWiggle, shadow);
 
-  tft.fillTriangle(x + 4, y - 17, x + 20, y - 46 - earWiggle, x + 22, y - 8, tan);
-  tft.fillTriangle(x + 9, y - 16, x + 18, y - 36 - earWiggle, x + 18, y - 8, cream);
-  tft.drawLine(x + 4, y - 17, x + 20, y - 46 - earWiggle, shadow);
+  dogSprite.fillTriangle(x + 4, y - 17, x + 20, y - 46 - earWiggle, x + 22, y - 8, tan);
+  dogSprite.fillTriangle(x + 9, y - 16, x + 18, y - 36 - earWiggle, x + 18, y - 8, cream);
+  dogSprite.drawLine(x + 4, y - 17, x + 20, y - 46 - earWiggle, shadow);
 
-  tft.fillEllipse(x, y - 10, 24, 28, tan);
-  tft.fillEllipse(x + 17, y - 5, 22, 17, lightTan);
-  tft.fillEllipse(x + 19, y + 2, 18, 11, cream);
-  tft.fillEllipse(x - 7, y + 8, 14, 10, cream);
-  tft.fillTriangle(x - 20, y - 20, x - 1, y - 33, x + 10, y - 20, lightTan);
+  dogSprite.fillEllipse(x, y - 10, 24, 28, tan);
+  dogSprite.fillEllipse(x + 17, y - 5, 22, 17, lightTan);
+  dogSprite.fillEllipse(x + 19, y + 2, 18, 11, cream);
+  dogSprite.fillEllipse(x - 7, y + 8, 14, 10, cream);
+  dogSprite.fillTriangle(x - 20, y - 20, x - 1, y - 33, x + 10, y - 20, lightTan);
 
-  if (blink) {
-    tft.drawFastHLine(x + 4, y - 12, 8, dark);
+  if (mood == 4) {
+    dogSprite.drawLine(x + 4, y - 17, x + 12, y - 9, dark);
+    dogSprite.drawLine(x + 12, y - 17, x + 4, y - 9, dark);
+  } else if (mood == 3) {
+    dogSprite.drawLine(x + 4, y - 16, x + 12, y - 12, dark);
+    dogSprite.fillCircle(x + 9, y - 11, 2, dark);
+    dogSprite.fillEllipse(x + 26, y - 19, 3, 6, sweat);
+  } else if (mood == 2 || blink) {
+    dogSprite.drawFastHLine(x + 4, y - 12, 8, dark);
   } else {
-    tft.fillCircle(x + 8, y - 13, 3, dark);
-    tft.fillCircle(x + 9, y - 14, 1, uiText());
+    dogSprite.fillCircle(x + 8, y - 13, 3, dark);
+    dogSprite.fillCircle(x + 9, y - 14, 1, uiText());
   }
 
-  tft.fillEllipse(x + 34 + breath, y - 5, 6, 4, nose);
-  tft.drawLine(x + 28, y, x + 20, y + 4, shadow);
-  tft.drawPixel(x + 29, y + 6, shadow);
-  tft.drawPixel(x + 30, y + 7, shadow);
-  tft.fillCircle(x + 7, y + 3, 2, blush);
+  dogSprite.fillEllipse(x + 34 + breath, y - 5, 6, 4, nose);
+  dogSprite.drawLine(x + 28, y, x + 20, y + 4, shadow);
+  if (mood == 1) {
+    dogSprite.drawLine(x + 22, y + 7, x + 26, y + 9, shadow);
+    dogSprite.drawLine(x + 26, y + 9, x + 31, y + 6, shadow);
+  } else if (mood == 2) {
+    dogSprite.drawFastHLine(x + 24, y + 7, 7, shadow);
+    dogSprite.fillCircle(x + 31, y + 12 + breath, 2, blush);
+  } else if (mood == 3) {
+    dogSprite.drawLine(x + 24, y + 10, x + 28, y + 7, shadow);
+    dogSprite.drawLine(x + 28, y + 7, x + 32, y + 10, shadow);
+  } else if (mood == 4) {
+    dogSprite.drawCircle(x + 27, y + 8, 3, shadow);
+    dogSprite.drawCircle(x + 28, y + 8, 3, shadow);
+  } else {
+    dogSprite.drawPixel(x + 29, y + 6, shadow);
+    dogSprite.drawPixel(x + 30, y + 7, shadow);
+  }
+  dogSprite.fillCircle(x + 7, y + 3, 2, blush);
 
-  tft.drawFastHLine(x - 18, y + 24, 35, cream);
-  tft.drawFastHLine(x - 20, y + 27, 40, lightTan);
-  tft.drawCircle(x - 24, y - 22, 2 + breath, uiMint());
+  dogSprite.setTextColor(uiText(), uiBg());
+  if (mood == 0) {
+    dogSprite.drawString("?", x + 42, y - 24, 2);
+  } else if (mood == 1) {
+    dogSprite.drawCircle(x - 24, y - 22, 2 + breath, uiMint());
+    dogSprite.fillCircle(x + 41, y - 21, 2, uiLemon());
+  } else if (mood == 2) {
+    dogSprite.drawString("z", x + 38, y - 24, 2);
+    dogSprite.drawString("Z", x + 48, y - 34, 2);
+  } else if (mood == 3) {
+    dogSprite.drawString("!", x + 42, y - 26, 2);
+  } else {
+    dogSprite.drawCircle(x + 42, y - 24, 5 + breath, uiCoral());
+  }
+
+  dogSprite.drawFastHLine(x - 18, y + 24, 35, cream);
+  dogSprite.drawFastHLine(x - 20, y + 27, 40, lightTan);
+  dogSprite.pushSprite(10, 50);
 }
 
 void drawCo2Sensor()
@@ -1207,6 +1259,7 @@ void drawCo2Sensor()
   tft.fillScreen(uiBg());
   drawHeader("CO2 Sensor");
   drawCo2Values();
+  drawCo2DogAvatar();
   drawFooter("Press: reset  Hold: back");
 }
 
