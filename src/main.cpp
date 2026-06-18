@@ -1168,10 +1168,23 @@ void drawCo2DogAvatar()
   else if (co2Ppm < 2000) mood = 3;
   else mood = 4;
 
-  int frame = (millis() / 360) % 8;
-  bool blink = frame == 0 && mood != 4;
-  int earWiggle = (frame % 4 == 1) ? -2 : ((frame % 4 == 3) ? 2 : 0);
-  int breath = (frame % 4) < 2 ? 0 : 1;
+  int frame = (millis() / 240) % 24;
+  int action = frame % 6;
+  bool blink = action == 0 && mood != 4;
+  int earWiggle = (action == 1) ? -3 : ((action == 4) ? 3 : 0);
+  int breath = action < 3 ? 0 : 1;
+  int headBob = (action == 2 || action == 3) ? 1 : 0;
+  int noseWiggle = (action == 1 || action == 5) ? 1 : 0;
+  int pawLift = (action == 2 || action == 5) ? -3 : 0;
+  if (mood == 2) {
+    earWiggle += 2;
+    headBob += 1;
+  } else if (mood == 3) {
+    headBob = (action % 2 == 0) ? -1 : 1;
+  } else if (mood == 4) {
+    earWiggle = (action % 2 == 0) ? -4 : 4;
+    headBob = (action % 2 == 0) ? -1 : 1;
+  }
 
   uint16_t tan = tft.color565(190, 126, 62);
   uint16_t lightTan = tft.color565(226, 185, 122);
@@ -1183,8 +1196,8 @@ void drawCo2DogAvatar()
   uint16_t sweat = tft.color565(126, 216, 255);
 
   dogSprite.fillSprite(uiBg());
-  int x = 34;
-  int y = 43;
+  int x = 34 + (mood == 0 && action >= 3 ? 1 : 0);
+  int y = 43 + headBob;
 
   dogSprite.fillTriangle(x - 24, y - 20, x - 8, y - 54 + earWiggle, x - 2, y - 15, tan);
   dogSprite.fillTriangle(x - 18, y - 22, x - 8, y - 44 + earWiggle, x - 6, y - 17, cream);
@@ -1203,25 +1216,35 @@ void drawCo2DogAvatar()
   if (mood == 4) {
     dogSprite.drawLine(x + 4, y - 17, x + 12, y - 9, dark);
     dogSprite.drawLine(x + 12, y - 17, x + 4, y - 9, dark);
+    if (action >= 3) {
+      dogSprite.drawCircle(x + 8, y - 13, 6, dark);
+      dogSprite.drawCircle(x + 8, y - 13, 3, dark);
+    }
   } else if (mood == 3) {
-    dogSprite.drawLine(x + 4, y - 16, x + 12, y - 12, dark);
-    dogSprite.fillCircle(x + 9, y - 11, 2, dark);
-    dogSprite.fillEllipse(x + 26, y - 19, 3, 6, sweat);
+    dogSprite.drawLine(x + 3, y - 16, x + 12, y - 12, dark);
+    dogSprite.fillCircle(x + 9, y - 11, action == 4 ? 1 : 2, dark);
+    dogSprite.fillEllipse(x + 26, y - 19 + breath, 3, 6, sweat);
+    if (action == 1 || action == 5) dogSprite.fillEllipse(x + 31, y - 12, 2, 4, sweat);
   } else if (mood == 2 || blink) {
-    dogSprite.drawFastHLine(x + 4, y - 12, 8, dark);
+    dogSprite.drawFastHLine(x + 4, y - 12 + (mood == 2 ? 1 : 0), 8, dark);
   } else {
-    dogSprite.fillCircle(x + 8, y - 13, 3, dark);
-    dogSprite.fillCircle(x + 9, y - 14, 1, uiText());
+    dogSprite.fillCircle(x + 8, y - 13, mood == 0 && action >= 3 ? 4 : 3, dark);
+    dogSprite.fillCircle(x + 9 + (mood == 0 ? noseWiggle : 0), y - 14, 1, uiText());
   }
 
-  dogSprite.fillEllipse(x + 34 + breath, y - 5, 6, 4, nose);
+  dogSprite.fillEllipse(x + 34 + breath + noseWiggle, y - 5, 6, 4, nose);
   dogSprite.drawLine(x + 28, y, x + 20, y + 4, shadow);
   if (mood == 1) {
     dogSprite.drawLine(x + 22, y + 7, x + 26, y + 9, shadow);
     dogSprite.drawLine(x + 26, y + 9, x + 31, y + 6, shadow);
+    if (action == 3 || action == 4) {
+      dogSprite.fillEllipse(x + 28, y + 12, 4, 5, blush);
+      dogSprite.drawFastVLine(x + 28, y + 9, 5, shadow);
+    }
   } else if (mood == 2) {
     dogSprite.drawFastHLine(x + 24, y + 7, 7, shadow);
     dogSprite.fillCircle(x + 31, y + 12 + breath, 2, blush);
+    if (action >= 3) dogSprite.fillEllipse(x + 33, y + 15, 2, 4, sweat);
   } else if (mood == 3) {
     dogSprite.drawLine(x + 24, y + 10, x + 28, y + 7, shadow);
     dogSprite.drawLine(x + 28, y + 7, x + 32, y + 10, shadow);
@@ -1231,24 +1254,43 @@ void drawCo2DogAvatar()
   } else {
     dogSprite.drawPixel(x + 29, y + 6, shadow);
     dogSprite.drawPixel(x + 30, y + 7, shadow);
+    if (action == 2) {
+      dogSprite.drawFastHLine(x + 38, y - 5, 5, uiMuted());
+      dogSprite.drawFastHLine(x + 40, y - 1, 6, uiMuted());
+    }
   }
   dogSprite.fillCircle(x + 7, y + 3, 2, blush);
 
   dogSprite.setTextColor(uiText(), uiBg());
   if (mood == 0) {
-    dogSprite.drawString("?", x + 42, y - 24, 2);
+    if (action < 3) dogSprite.drawString("?", x + 42, y - 24, 2);
+    else {
+      dogSprite.drawCircle(x + 44, y - 20, 3, uiMint());
+      dogSprite.drawPixel(x + 45, y - 21, uiText());
+    }
   } else if (mood == 1) {
-    dogSprite.drawCircle(x - 24, y - 22, 2 + breath, uiMint());
-    dogSprite.fillCircle(x + 41, y - 21, 2, uiLemon());
+    if (action == 1 || action == 4) {
+      dogSprite.fillCircle(x + 43, y - 21, 3, blush);
+      dogSprite.fillCircle(x + 48, y - 21, 3, blush);
+      dogSprite.fillTriangle(x + 40, y - 20, x + 51, y - 20, x + 46, y - 13, blush);
+    } else {
+      dogSprite.drawCircle(x - 24, y - 22, 2 + breath, uiMint());
+      dogSprite.fillCircle(x + 41, y - 21, 2, uiLemon());
+      if (action == 5) dogSprite.drawLine(x - 26, y - 28, x - 21, y - 34, uiLemon());
+    }
   } else if (mood == 2) {
-    dogSprite.drawString("z", x + 38, y - 24, 2);
-    dogSprite.drawString("Z", x + 48, y - 34, 2);
+    dogSprite.drawString(action < 3 ? "z" : "Z", x + 38, y - 24, 2);
+    dogSprite.drawString("Z", x + 48, y - 34 - breath, 2);
   } else if (mood == 3) {
-    dogSprite.drawString("!", x + 42, y - 26, 2);
+    dogSprite.drawString(action % 2 == 0 ? "!" : "!!", x + 39, y - 26, 2);
   } else {
     dogSprite.drawCircle(x + 42, y - 24, 5 + breath, uiCoral());
+    dogSprite.drawLine(x + 38, y - 28, x + 47, y - 20, uiCoral());
+    dogSprite.drawLine(x + 47, y - 28, x + 38, y - 20, uiCoral());
   }
 
+  dogSprite.fillEllipse(x - 12, y + 28 + pawLift, 7, 5, lightTan);
+  dogSprite.drawLine(x - 15, y + 28 + pawLift, x - 18, y + 24 + pawLift, shadow);
   dogSprite.drawFastHLine(x - 18, y + 24, 35, cream);
   dogSprite.drawFastHLine(x - 20, y + 27, 40, lightTan);
   dogSprite.pushSprite(10, 50);
