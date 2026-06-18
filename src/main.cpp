@@ -1352,16 +1352,16 @@ void drawAbout()
 {
   tft.fillScreen(uiBg());
   drawHeader("About");
-  drawTinyIcon(4, 18, 44, uiMint(), uiBg());
+  drawTinyIcon(4, 24, 52, uiMint(), uiBg());
   tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(uiText(), uiBg());
-  tft.drawString("Desktop CO2 Monitor", 44, 44, 2);
+  drawUtf8Text("尖尖", 48, 44, uiText(), uiBg());
+  tft.setTextDatum(ML_DATUM);
   tft.setTextColor(uiMint(), uiBg());
-  tft.drawString("Author: You + Codex", 44, 68, 2);
+  tft.drawString("Jianjian", 48, 76, 2);
   tft.setTextColor(uiMuted(), uiBg());
-  tft.drawString("ESP32-S3 / JW01 / ST7789", 44, 92, 2);
-  tft.drawString("CO2, market ticker, answer book", 44, 116, 2);
-  tft.drawString("Encoder UI + AP WiFi setup", 44, 138, 2);
+  tft.drawString("A tiny desktop CO2 buddy", 48, 104, 2);
+  tft.setTextColor(uiText(), uiBg());
+  tft.drawString("by You + Codex", 48, 128, 2);
   drawFooter("Hold: back");
 }
 
