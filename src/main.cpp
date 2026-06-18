@@ -1359,7 +1359,7 @@ void drawAbout()
   tft.setTextColor(uiMuted(), uiBg());
   tft.drawString("A tiny desktop CO2 buddy", 48, 96, 2);
   tft.setTextColor(uiText(), uiBg());
-  tft.drawString("by You + Codex", 48, 124, 2);
+  tft.drawString("by zihao", 48, 124, 2);
   drawFooter("Hold: back");
 }
 
