@@ -1,7 +1,7 @@
-# Jianjian v0.1.0-beta
+# Jianjian v1.0.0-beta
 
 - CO2 Level screen with JW01 UART sensor support and animated dog companion.
-- Password Vault with desktop pairing, saved credentials, USB HID typing, safe-code dial, and long-press credential deletion.
+- Password Vault with desktop pairing, persistent paired session, USB HID typing, safe-code dial, and long-press credential deletion.
 - Wi-Fi setup portal with saved-network management.
 - Answer Book, Market Ticker, and About screens.
 - Horizontal display UI with rotary-encoder navigation.

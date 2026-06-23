@@ -13,3 +13,4 @@ dist_vault_ime/
 backups/
 src/*.bak
 tools/__pycache__/
+release/*.exe
