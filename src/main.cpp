@@ -1,4 +1,4 @@
-﻿#include <Arduino.h>
+#include <Arduino.h>
 #include <DNSServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -6,6 +6,12 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <USB.h>
+#include <USBHIDKeyboard.h>
+
+#if ARDUINO_USB_MODE != 0
+#error Password Vault requires ARDUINO_USB_MODE=0 for USB CDC and HID composite support.
+#endif
 #include "ChineseFont.h"
 
 #if __has_include(<esp_eap_client.h>)
@@ -19,9 +25,11 @@
 TFT_eSPI tft;
 TFT_eSprite dogSprite = TFT_eSprite(&tft);
 Preferences prefs;
+Preferences vaultPrefs;
 WebServer server(80);
 DNSServer dnsServer;
 HardwareSerial jw01Serial(1);
+USBHIDKeyboard keyboard;
 
 constexpr int POWER_ON_PIN = 15;
 constexpr int ENCODER_CLK_PIN = 10;
@@ -29,7 +37,7 @@ constexpr int ENCODER_DT_PIN = 11;
 constexpr int ENCODER_SW_PIN = 12;
 constexpr int JW01_RX_PIN = 18;
 constexpr int JW01_TX_PIN = 17;
-constexpr int ENCODER_TRANSITIONS_PER_STEP = 2;
+constexpr int ENCODER_TRANSITIONS_PER_STEP = 4;
 constexpr uint32_t LONG_PRESS_MS = 750;
 constexpr uint32_t DEBOUNCE_MS = 35;
 constexpr uint16_t SCREEN_W = 320;
@@ -37,6 +45,12 @@ constexpr uint16_t SCREEN_H = 170;
 constexpr uint16_t HEADER_H = 28;
 constexpr uint16_t FOOTER_H = 20;
 constexpr int MAX_SAVED_WIFI = 6;
+constexpr int MAX_VAULT_ENTRIES = 8;
+constexpr int VAULT_VISIBLE_ROWS = 4;
+constexpr uint32_t VAULT_PAIR_WINDOW_MS = 45000;
+constexpr uint32_t SAFE_DWELL_MS = 700;
+constexpr uint32_t SAFE_DOUBLE_MS = 420;
+constexpr int MAIN_MENU_VISIBLE_ROWS = 5;
 constexpr int WIFI_VISIBLE_ROWS = 5;
 constexpr byte DNS_PORT = 53;
 IPAddress apIP(192, 168, 4, 1);
@@ -46,8 +60,18 @@ enum class ScreenMode {
   AnswerBook,
   MarketTicker,
   CO2Sensor,
+  PasswordVault,
   WiFiSettings,
   About
+};
+
+enum class VaultPage {
+  Menu,
+  List,
+  Field,
+  PairPrompt,
+  SafeMenu,
+  SafeDial
 };
 
 struct WiFiConfig {
@@ -55,6 +79,12 @@ struct WiFiConfig {
   String username;
   String password;
   bool enterprise;
+};
+
+struct VaultEntry {
+  String site;
+  String username;
+  String password;
 };
 
 struct MarketIndex {
@@ -74,16 +104,19 @@ struct ScannedNetwork {
 };
 
 const char *mainMenu[] = {
+  "CO2 Level",
+  "Password Vault",
   "Answer Book",
   "Market Ticker",
-  "CO2 Sensor",
   "WiFi Settings",
   "About"
 };
 constexpr int MAIN_MENU_COUNT = sizeof(mainMenu) / sizeof(mainMenu[0]);
+const int mainMenuIconKinds[] = {2, 5, 0, 1, 3, 4};
 
 const char *wifiSetupLabel = "Setup Portal";
 const char *wifiSavedLabel = "Saved WiFi";
+const char *wifiInstructionLabel = "Setting Instruction";
 const char *wifiBackLabel = "Back";
 
 const char *answerBookEntries[] = {
@@ -375,11 +408,18 @@ ScreenMode mode = ScreenMode::MainMenu;
 ScreenMode previousMode = ScreenMode::MainMenu;
 WiFiConfig wifiConfig;
 WiFiConfig savedWiFis[MAX_SAVED_WIFI];
+VaultEntry vaultEntries[MAX_VAULT_ENTRIES];
 
 int selectedIndex = 0;
+int mainTopIndex = 0;
 int wifiSelectedIndex = 0;
 int wifiTopIndex = 0;
 int savedWiFiCount = 0;
+int vaultCount = 0;
+int vaultSelectedIndex = 0;
+int vaultTopIndex = 0;
+int vaultActiveEntry = -1;
+int pendingDeleteVault = -1;
 int pendingDeleteWifi = -1;
 bool wifiListOpen = false;
 int answerIndex = 0;
@@ -410,9 +450,27 @@ uint32_t lastCo2ByteAt = 0;
 uint32_t lastCo2BaudSwitch = 0;
 uint32_t co2BytesAtBaudSwitch = 0;
 bool redrawRequested = true;
+bool toggleImeForTyping = true;
+bool safeCodeSet = false;
+bool safeSettingMode = false;
+uint8_t safeCodeValues[4] = {0, 0, 0, 0};
+int8_t safeCodeDirections[4] = {0, 0, 0, 0};
+uint8_t safeEnteredValues[4] = {0, 0, 0, 0};
+int8_t safeEnteredDirections[4] = {0, 0, 0, 0};
+int safeDialValue = 0;
+int safeRenderedDialValue = -1;
+int safeDialDirection = 0;
+int safeEnteredCount = 0;
+uint32_t safeLastMoveAt = 0;
+uint32_t safeConfirmAt = 0;
 bool connectingWiFi = false;
 bool configApRunning = false;
 bool autoWiFiConnect = false;
+bool wifiInstructionOpen = false;
+VaultPage vaultPage = VaultPage::Menu;
+ScreenMode vaultReturnMode = ScreenMode::MainMenu;
+String vaultPairToken;
+uint32_t vaultPairExpiresAt = 0;
 int autoWiFiBaseIndex = 0;
 int autoWiFiAttempt = 0;
 String statusLine = "Ready";
@@ -421,6 +479,7 @@ uint32_t co2FrameCount = 0;
 uint32_t co2ByteCount = 0;
 String co2RawFrame = "none";
 String co2Status = "warming up";
+String serialCommandBuffer;
 uint8_t jw01Buffer[48];
 uint8_t jw01BufferLen = 0;
 const uint32_t jw01Bauds[] = {9600};
@@ -433,6 +492,26 @@ void drawCo2DogAvatar();
 void setJw01Baud(uint8_t index);
 void startConfigAp();
 void connectWiFi(bool showSettings = true, bool autoMode = false);
+void drawPasswordVault();
+void drawSafeDial(bool entering=false);
+
+void toggleInputMethod()
+{
+  keyboard.press(KEY_LEFT_CTRL);
+  keyboard.press(' ');
+  delay(30);
+  keyboard.releaseAll();
+  delay(140);
+}
+
+void typeCredentialText(const String &text)
+{
+  if (toggleImeForTyping) toggleInputMethod();
+  keyboard.print(text);
+  keyboard.releaseAll();
+  delay(80);
+  if (toggleImeForTyping) toggleInputMethod();
+}
 
 String masked(const String &value)
 {
@@ -440,6 +519,36 @@ String masked(const String &value)
   String out;
   for (size_t i = 0; i < value.length(); i++) out += '*';
   return out;
+}
+
+int base64Digit(char c)
+{
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+bool decodeBase64(const String &encoded, String &decoded)
+{
+  decoded = "";
+  uint32_t buffer = 0;
+  int bits = 0;
+  for (size_t i = 0; i < encoded.length(); i++) {
+    char c = encoded[i];
+    if (c == '=') break;
+    int value = base64Digit(c);
+    if (value < 0) return false;
+    buffer = (buffer << 6) | static_cast<uint32_t>(value);
+    bits += 6;
+    while (bits >= 8) {
+      bits -= 8;
+      decoded += static_cast<char>((buffer >> bits) & 0xFF);
+    }
+  }
+  return true;
 }
 
 uint16_t uiBg() { return tft.color565(24, 24, 34); }
@@ -546,6 +655,83 @@ void loadConfig()
   }
 }
 
+void saveVault()
+{
+  vaultPrefs.begin("vault", false);
+  vaultPrefs.putInt("count", vaultCount);
+  vaultPrefs.putBool("imeToggle", toggleImeForTyping);
+  vaultPrefs.putBool("safeSet", safeCodeSet);
+  for (int i = 0; i < 4; i++) {
+    vaultPrefs.putUChar(("safeV" + String(i)).c_str(), safeCodeValues[i]);
+    vaultPrefs.putChar(("safeD" + String(i)).c_str(), safeCodeDirections[i]);
+  }
+  for (int i = 0; i < MAX_VAULT_ENTRIES; i++) {
+    String suffix = String(i);
+    if (i < vaultCount) {
+      vaultPrefs.putString(("site" + suffix).c_str(), vaultEntries[i].site);
+      vaultPrefs.putString(("user" + suffix).c_str(), vaultEntries[i].username);
+      vaultPrefs.putString(("pass" + suffix).c_str(), vaultEntries[i].password);
+    } else {
+      vaultPrefs.remove(("site" + suffix).c_str());
+      vaultPrefs.remove(("user" + suffix).c_str());
+      vaultPrefs.remove(("pass" + suffix).c_str());
+    }
+  }
+  vaultPrefs.end();
+}
+
+void loadVault()
+{
+  vaultCount = 0;
+  vaultPrefs.begin("vault", true);
+  toggleImeForTyping = vaultPrefs.getBool("imeToggle", true);
+  safeCodeSet = vaultPrefs.getBool("safeSet", false);
+  for (int i = 0; i < 4; i++) {
+    safeCodeValues[i] = vaultPrefs.getUChar(("safeV" + String(i)).c_str(), 0);
+    safeCodeDirections[i] = vaultPrefs.getChar(("safeD" + String(i)).c_str(), 0);
+  }
+  int count = vaultPrefs.getInt("count", 0);
+  vaultCount = min(max(count, 0), MAX_VAULT_ENTRIES);
+  for (int i = 0; i < vaultCount; i++) {
+    String suffix = String(i);
+    vaultEntries[i].site = vaultPrefs.getString(("site" + suffix).c_str(), "");
+    vaultEntries[i].username = vaultPrefs.getString(("user" + suffix).c_str(), "");
+    vaultEntries[i].password = vaultPrefs.getString(("pass" + suffix).c_str(), "");
+  }
+  vaultPrefs.end();
+}
+
+void upsertVaultEntry(const String &site, const String &username, const String &password)
+{
+  int found = -1;
+  for (int i = 0; i < vaultCount; i++) {
+    if (vaultEntries[i].site == site) {
+      found = i;
+      break;
+    }
+  }
+
+  if (found < 0) {
+    if (vaultCount >= MAX_VAULT_ENTRIES) {
+      for (int i = 1; i < vaultCount; i++) vaultEntries[i - 1] = vaultEntries[i];
+      vaultCount = MAX_VAULT_ENTRIES - 1;
+    }
+    found = vaultCount++;
+  }
+
+  vaultEntries[found] = {site, username, password};
+  saveVault();
+}
+
+void deleteVaultEntry(int index)
+{
+  if (index < 0 || index >= vaultCount) return;
+  for (int i = index + 1; i < vaultCount; i++) vaultEntries[i - 1] = vaultEntries[i];
+  vaultCount--;
+  pendingDeleteVault = -1;
+  if (vaultSelectedIndex >= vaultCount + 1) vaultSelectedIndex = max(0, vaultCount);
+  saveVault();
+}
 void clearConfig()
 {
   prefs.begin("ui", false);
@@ -554,6 +740,7 @@ void clearConfig()
   savedWiFiCount = 0;
   pendingDeleteWifi = -1;
   wifiListOpen = false;
+  wifiInstructionOpen = false;
   wifiSelectedIndex = 0;
   wifiTopIndex = 0;
   wifiConfig = {"", "", "", false};
@@ -612,12 +799,13 @@ bool textNeedsMarquee(const String &text, int width)
 
 int wifiItemCount()
 {
-  return wifiListOpen ? savedWiFiCount + 1 : 3;
+  if (wifiInstructionOpen) return 1;
+  return wifiListOpen ? savedWiFiCount + 1 : 4;
 }
 
 bool wifiIndexIsSaved(int index)
 {
-  return wifiListOpen && index >= 0 && index < savedWiFiCount;
+  return wifiListOpen && !wifiInstructionOpen && index >= 0 && index < savedWiFiCount;
 }
 
 int wifiSavedIndex(int index)
@@ -627,9 +815,12 @@ int wifiSavedIndex(int index)
 
 String wifiItemLabel(int index)
 {
+  if (wifiInstructionOpen) return wifiBackLabel;
+
   if (!wifiListOpen) {
     if (index == 0) return wifiSetupLabel;
     if (index == 1) return wifiSavedLabel;
+    if (index == 2) return wifiInstructionLabel;
     return wifiBackLabel;
   }
 
@@ -695,9 +886,10 @@ void drawTinyIcon(int kind, int x, int y, uint16_t color, uint16_t bg)
       tft.drawFastVLine(x + 8, y - 1, 7, color);
       break;
     default:
-      tft.drawRoundRect(x + 2, y - 6, 12, 12, 3, color);
-      tft.drawLine(x + 5, y - 1, x + 8, y + 3, color);
-      tft.drawLine(x + 8, y + 3, x + 13, y - 4, color);
+      tft.drawCircle(x + 5, y - 2, 4, color);
+      tft.drawLine(x + 8, y + 1, x + 16, y + 1, color);
+      tft.drawFastVLine(x + 12, y + 1, 4, color);
+      tft.drawFastVLine(x + 15, y + 1, 3, color);
       break;
   }
 }
@@ -984,7 +1176,7 @@ void drawSelectableRow(int index, int y, const String &text, bool selected)
   }
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(fg, bg);
-  drawTinyIcon(index, 18, y, selected ? uiHeaderText() : uiMint(), bg);
+  drawTinyIcon(mainMenuIconKinds[index], 18, y, selected ? uiHeaderText() : uiMint(), bg);
   drawMarqueeText(text, 44, y, SCREEN_W - 76, fg, bg, selected);
   (void)index;
 }
@@ -1024,27 +1216,36 @@ void drawWiFiRows()
   if (last < count) tft.drawString("v", 310, 142, 2);
 }
 
+void drawMainRows()
+{
+  tft.fillRect(0, 30, SCREEN_W, 120, uiBg());
+  int last = min(MAIN_MENU_COUNT, mainTopIndex + MAIN_MENU_VISIBLE_ROWS);
+  for (int i = mainTopIndex; i < last; i++) {
+    drawSelectableRow(i, 42 + (i - mainTopIndex) * 24, mainMenu[i], i == selectedIndex);
+  }
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(uiMuted(), uiBg());
+  if (mainTopIndex > 0) tft.drawString("^", 310, 34, 2);
+  if (last < MAIN_MENU_COUNT) tft.drawString("v", 310, 142, 2);
+}
+
 void drawMainMenu()
 {
   tft.fillScreen(uiBg());
   drawHeader("Main Control");
   renderedSelectedIndex = selectedIndex;
-
-  for (int i = 0; i < MAIN_MENU_COUNT; i++) {
-    drawSelectableRow(i, 42 + i * 24, mainMenu[i], i == selectedIndex);
-  }
+  drawMainRows();
 
   String wifi = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "WiFi offline";
   drawFooter(wifi);
 }
-
 void updateMainSelection(int oldIndex, int newIndex)
 {
-  drawSelectableRow(oldIndex, 42 + oldIndex * 24, mainMenu[oldIndex], false);
-  drawSelectableRow(newIndex, 42 + newIndex * 24, mainMenu[newIndex], true);
+  drawSelectableRow(oldIndex, 42 + (oldIndex - mainTopIndex) * 24, mainMenu[oldIndex], false);
+  drawSelectableRow(newIndex, 42 + (newIndex - mainTopIndex) * 24, mainMenu[newIndex], true);
   renderedSelectedIndex = newIndex;
 }
-
 void drawAnswerBook()
 {
   tft.fillScreen(uiBg());
@@ -1291,6 +1492,7 @@ void drawCo2DogAvatar()
 
   dogSprite.fillEllipse(x - 12, y + 28 + pawLift, 7, 5, lightTan);
   dogSprite.drawLine(x - 15, y + 28 + pawLift, x - 18, y + 24 + pawLift, shadow);
+  dogSprite.fillTriangle(x - 4, y + 12, x + 8, y + 28, x - 16, y + 28, cream);
   dogSprite.drawFastHLine(x - 18, y + 24, 35, cream);
   dogSprite.drawFastHLine(x - 20, y + 27, 40, lightTan);
   dogSprite.pushSprite(10, 50);
@@ -1299,7 +1501,7 @@ void drawCo2DogAvatar()
 void drawCo2Sensor()
 {
   tft.fillScreen(uiBg());
-  drawHeader("CO2 Sensor");
+  drawHeader("CO2 Level");
   drawCo2Values();
   drawCo2DogAvatar();
   drawFooter("Press: reset  Hold: back");
@@ -1308,14 +1510,22 @@ void drawCo2Sensor()
 void drawWiFiSettings()
 {
   tft.fillScreen(uiBg());
-  drawHeader(wifiListOpen ? "Saved WiFi" : "WiFi Settings");
+  drawHeader(wifiInstructionOpen ? "Setting Help" : (wifiListOpen ? "Saved WiFi" : "WiFi Settings"));
   keepWifiSelectionVisible();
   renderedWifiIndex = wifiSelectedIndex;
 
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(uiMuted(), uiBg());
-  if (!wifiListOpen) {
-    tft.drawString("AP: ESP32-Setup", 8, 42, 2);
+  if (wifiInstructionOpen) {
+    tft.drawString("1. Join Jianjian-Setup", 8, 42, 2);
+    tft.drawString("2. Password 12345678", 8, 62, 2);
+    tft.drawString("3. Open 192.168.4.1", 8, 82, 2);
+    tft.drawString("4. Pick WiFi and save", 8, 102, 2);
+    tft.setTextColor(uiText(), uiBg());
+    tft.drawString("Campus WiFi: use", 8, 126, 2);
+    tft.drawString("username + password", 8, 144, 2);
+  } else if (!wifiListOpen) {
+    tft.drawString("AP: Jianjian-Setup", 8, 42, 2);
     tft.drawString("Pass: 12345678", 8, 62, 2);
     tft.drawString("Portal: 192.168.4.1", 8, 82, 2);
 
@@ -1369,18 +1579,23 @@ void drawCurrentScreen()
   else if (mode == ScreenMode::AnswerBook) drawAnswerBook();
   else if (mode == ScreenMode::MarketTicker) drawMarketTicker();
   else if (mode == ScreenMode::CO2Sensor) drawCo2Sensor();
+  else if (mode == ScreenMode::PasswordVault) { if (vaultPage == VaultPage::SafeDial) drawSafeDial(); else drawPasswordVault(); }
   else if (mode == ScreenMode::WiFiSettings) drawWiFiSettings();
   else if (mode == ScreenMode::About) drawAbout();
 }
 
 void moveMainSelection(int direction)
 {
-  int old = selectedIndex;
+  int oldIndex = selectedIndex;
+  int oldTopIndex = mainTopIndex;
   selectedIndex += direction;
   if (selectedIndex < 0) selectedIndex = MAIN_MENU_COUNT - 1;
   if (selectedIndex >= MAIN_MENU_COUNT) selectedIndex = 0;
-  if (renderedSelectedIndex >= 0) updateMainSelection(old, selectedIndex);
-  else drawMainMenu();
+  if (selectedIndex < mainTopIndex) mainTopIndex = selectedIndex;
+  if (selectedIndex >= mainTopIndex + MAIN_MENU_VISIBLE_ROWS) mainTopIndex = selectedIndex - MAIN_MENU_VISIBLE_ROWS + 1;
+
+  if (mainTopIndex != oldTopIndex) drawMainRows();
+  else updateMainSelection(oldIndex, selectedIndex);
 }
 
 void moveWiFiSelection(int direction)
@@ -1896,10 +2111,135 @@ void handleWiFiSelect()
   drawWiFiSettings();
 }
 
+int vaultItems() { if (vaultPage == VaultPage::Menu) return 5; if (vaultPage == VaultPage::PairPrompt) return 2; if (vaultPage == VaultPage::SafeMenu) return safeCodeSet ? 3 : 2; if (vaultPage == VaultPage::Field) return 4; return vaultCount + 1; }
+String vaultLabel(int i) {
+  if (vaultPage == VaultPage::Menu) { if(i==0)return "Desktop Pairing"; if(i==1)return "Type Saved Credential"; if(i==2)return toggleImeForTyping?"Input Mode: Toggle IME":"Input Mode: Direct ASCII"; if(i==3)return "Safe Code"; return "Back"; }
+  if (vaultPage == VaultPage::PairPrompt) return i==0?"Yes, connect":"No, deny";
+  if (vaultPage == VaultPage::SafeMenu) { if(i==0)return safeCodeSet?"Reset Safe Code":"Set Safe Code"; if(safeCodeSet&&i==1)return "Remove Safe Code"; return "Back"; }
+  if (vaultPage == VaultPage::Field) { if(i==0)return "Type Username"; if(i==1)return "Type Password"; if(i==2)return "Type Username + Password"; return "Back"; }
+  return i<vaultCount?vaultEntries[i].site:"Back";
+}
+void drawVaultRow(int index, bool selected) {
+  int row=index-vaultTopIndex;
+  if(row<0||row>=VAULT_VISIBLE_ROWS)return;
+  int y=54+row*23;
+  uint16_t bg=selected?uiSelect():uiBg();
+  tft.fillRect(8,y-10,304,20,bg);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(selected?uiHeaderText():uiText(),bg);
+  tft.drawString(vaultLabel(index),20,y,2);
+}
+void drawVaultRows() {
+  tft.fillRect(0,32,SCREEN_W,118,uiBg());
+  int count=vaultItems();
+  if(vaultSelectedIndex<0)vaultSelectedIndex=0;
+  if(vaultSelectedIndex>=count)vaultSelectedIndex=count-1;
+  if(vaultSelectedIndex<vaultTopIndex)vaultTopIndex=vaultSelectedIndex;
+  if(vaultSelectedIndex>=vaultTopIndex+VAULT_VISIBLE_ROWS)vaultTopIndex=vaultSelectedIndex-VAULT_VISIBLE_ROWS+1;
+  int last=min(count,vaultTopIndex+VAULT_VISIBLE_ROWS);
+  for(int i=vaultTopIndex;i<last;i++)drawVaultRow(i,i==vaultSelectedIndex);
+  if(vaultTopIndex>0)tft.drawString("^",304,38,2);
+  if(last<count)tft.drawString("v",304,142,2);
+}
+void updateVaultSelection(int oldIndex,int newIndex) {
+  drawVaultRow(oldIndex,false);
+  drawVaultRow(newIndex,true);
+}
+void drawPasswordVault(){ tft.fillScreen(uiBg()); drawHeader(vaultPage==VaultPage::PairPrompt?"Desktop Pairing":(vaultPage==VaultPage::SafeMenu?"Safe Code":"Password Vault")); drawVaultRows(); drawFooter(vaultPage==VaultPage::PairPrompt?"Press: confirm  Hold: deny":"Press: select  Hold: back"); }
+void drawSafeDial(bool entering){
+  int cx=160,cy=88,r=55;
+  if(entering||safeRenderedDialValue<0){
+    tft.fillScreen(uiBg());
+    drawHeader(safeSettingMode?"Set Safe Code":"Please input password");
+    tft.drawCircle(cx,cy,r,uiMint());
+    for(int i=0;i<100;i++){float a=(-90+i*3.6f)*DEG_TO_RAD;int in=r-(i%10?4:8);tft.drawLine(cx+cosf(a)*in,cy+sinf(a)*in,cx+cosf(a)*r,cy+sinf(a)*r,uiMuted());}
+  }else{
+    float oldAngle=(-90+safeRenderedDialValue*3.6f)*DEG_TO_RAD;
+    tft.fillCircle(cx+cosf(oldAngle)*(r-12),cy+sinf(oldAngle)*(r-12),4,uiBg());
+  }
+  tft.fillCircle(cx,cy,31,uiBg());
+  float angle=(-90+safeDialValue*3.6f)*DEG_TO_RAD;
+  tft.fillCircle(cx+cosf(angle)*(r-12),cy+sinf(angle)*(r-12),4,uiHeader());
+  char b[3];snprintf(b,3,"%02d",safeDialValue);
+  tft.setTextDatum(MC_DATUM);tft.setTextColor(uiText(),uiBg());tft.drawString(b,cx,cy,6);
+  safeRenderedDialValue=safeDialValue;
+  drawFooter(safeEnteredCount==4?"Press confirm | Double retry | Hold exit":(safeSettingMode?"Set 4 numbers | Hold exit":"Please input password | Hold exit"));
+}
+void startSafe(bool set){safeSettingMode=set;safeDialValue=0;safeRenderedDialValue=-1;safeEnteredCount=0;safeLastMoveAt=0;safeConfirmAt=0;vaultPage=VaultPage::SafeDial;drawSafeDial(true);}
+void finishSafeConfirm(){bool ok=true;for(int i=0;i<4;i++)if(safeEnteredValues[i]!=safeCodeValues[i]||safeEnteredDirections[i]!=safeCodeDirections[i])ok=false;if(safeSettingMode){for(int i=0;i<4;i++){safeCodeValues[i]=safeEnteredValues[i];safeCodeDirections[i]=safeEnteredDirections[i];}safeCodeSet=true;saveVault();vaultPage=VaultPage::SafeMenu;drawPasswordVault();}else if(ok){vaultPage=VaultPage::Menu;drawPasswordVault();}else{safeEnteredCount=0;safeDialValue=0;safeConfirmAt=0;drawSafeDial();drawFooter(safeSettingMode?"Format error - retry":"Password incorrect");}}
+void handleVaultRotate(int d){
+  if(vaultPage==VaultPage::SafeDial){safeDialValue=(safeDialValue+d+100)%100;safeDialDirection=d>0?1:-1;safeLastMoveAt=millis();safeConfirmAt=0;drawSafeDial();return;}
+  bool cancelledDelete=pendingDeleteVault>=0;
+  pendingDeleteVault=-1;
+  int oldIndex=vaultSelectedIndex;
+  int oldTopIndex=vaultTopIndex;
+  int n=vaultItems();vaultSelectedIndex=(vaultSelectedIndex+d+n)%n;
+  if(vaultSelectedIndex<vaultTopIndex)vaultTopIndex=vaultSelectedIndex;
+  if(vaultSelectedIndex>=vaultTopIndex+VAULT_VISIBLE_ROWS)vaultTopIndex=vaultSelectedIndex-VAULT_VISIBLE_ROWS+1;
+  if(vaultTopIndex!=oldTopIndex)drawVaultRows();
+  else updateVaultSelection(oldIndex,vaultSelectedIndex);
+  if(cancelledDelete)drawFooter(vaultPage==VaultPage::PairPrompt?"Press: confirm  Hold: deny":"Press: select  Hold: back");
+}
+void handleVaultPress(){
+  if(vaultPage==VaultPage::PairPrompt){
+    if(vaultSelectedIndex==0){vaultPairToken=String(static_cast<uint32_t>(esp_random()),HEX);vaultPairExpiresAt=0;Serial.printf("#PAIR_OK|%s\n",vaultPairToken.c_str());}
+    else{vaultPairToken="";vaultPairExpiresAt=0;Serial.println("#PAIR_DENY");}
+    vaultPage=VaultPage::Menu;vaultSelectedIndex=0;vaultTopIndex=0;drawPasswordVault();return;
+  }
+  if(vaultPage==VaultPage::SafeDial){
+    if(safeEnteredCount<4){drawFooter(safeSettingMode?"Format error - retry":"Password incorrect");return;}
+    if(safeConfirmAt&&millis()-safeConfirmAt<SAFE_DOUBLE_MS){safeEnteredCount=0;safeDialValue=0;safeConfirmAt=0;drawSafeDial();}
+    else{safeConfirmAt=millis();drawFooter("Confirming... double click to retry");}
+    return;
+  }
+  if(vaultPage==VaultPage::Menu){
+    if(vaultSelectedIndex==1){vaultPage=VaultPage::List;vaultSelectedIndex=0;vaultTopIndex=0;}
+    else if(vaultSelectedIndex==2){toggleImeForTyping=!toggleImeForTyping;saveVault();}
+    else if(vaultSelectedIndex==3){vaultPage=VaultPage::SafeMenu;vaultSelectedIndex=0;vaultTopIndex=0;}
+    else if(vaultSelectedIndex==4){mode=ScreenMode::MainMenu;drawMainMenu();return;}
+    drawPasswordVault();return;
+  }
+  if(vaultPage==VaultPage::SafeMenu){
+    if(vaultSelectedIndex==0){startSafe(true);return;}
+    if(safeCodeSet&&vaultSelectedIndex==1){safeCodeSet=false;saveVault();}
+    else{vaultPage=VaultPage::Menu;vaultSelectedIndex=0;vaultTopIndex=0;}
+    drawPasswordVault();return;
+  }
+  if(vaultPage==VaultPage::List){
+    if(pendingDeleteVault>=0){
+      deleteVaultEntry(pendingDeleteVault);
+      vaultSelectedIndex=min(vaultSelectedIndex,vaultCount);
+      drawPasswordVault();
+      drawFooter("Deleted");
+      return;
+    }
+    if(vaultSelectedIndex<vaultCount){vaultActiveEntry=vaultSelectedIndex;vaultPage=VaultPage::Field;vaultSelectedIndex=0;vaultTopIndex=0;}
+    else{vaultPage=VaultPage::Menu;vaultSelectedIndex=0;vaultTopIndex=0;}
+    drawPasswordVault();return;
+  }
+  if(vaultPage==VaultPage::Field){
+    if(vaultSelectedIndex==3){vaultPage=VaultPage::List;vaultSelectedIndex=0;vaultTopIndex=0;drawPasswordVault();return;}
+    if(vaultActiveEntry<0||vaultActiveEntry>=vaultCount){vaultPage=VaultPage::List;vaultSelectedIndex=0;vaultTopIndex=0;drawPasswordVault();return;}
+    if(vaultSelectedIndex==2){
+      typeCredentialText(vaultEntries[vaultActiveEntry].username);
+      keyboard.write(KEY_TAB);
+      delay(80);
+      typeCredentialText(vaultEntries[vaultActiveEntry].password);
+    } else if(vaultSelectedIndex==0) {
+      typeCredentialText(vaultEntries[vaultActiveEntry].username);
+    } else {
+      typeCredentialText(vaultEntries[vaultActiveEntry].password);
+    }
+    drawPasswordVault();
+    drawFooter("Typed to computer");
+  }
+}
+void updateSafe(){if(vaultPage!=VaultPage::SafeDial)return;if(safeEnteredCount<4&&safeLastMoveAt&&millis()-safeLastMoveAt>SAFE_DWELL_MS){safeEnteredValues[safeEnteredCount]=safeDialValue;safeEnteredDirections[safeEnteredCount++]=safeDialDirection;safeLastMoveAt=0;drawSafeDial();}if(safeConfirmAt&&millis()-safeConfirmAt>=SAFE_DOUBLE_MS){safeConfirmAt=0;finishSafeConfirm();}}
 void handleRotate(int direction)
 {
   if (mode == ScreenMode::MainMenu) moveMainSelection(direction);
   else if (mode == ScreenMode::AnswerBook) moveAnswer(direction);
+  else if (mode == ScreenMode::PasswordVault) handleVaultRotate(direction);
   else if (mode == ScreenMode::WiFiSettings) moveWiFiSelection(direction);
 }
 
@@ -1924,41 +2264,54 @@ void shuffleAnswer()
 void handleShortPress()
 {
   if (mode == ScreenMode::MainMenu) {
-    if (selectedIndex == 0) mode = ScreenMode::AnswerBook;
-    else if (selectedIndex == 1) {
-      mode = ScreenMode::MarketTicker;
-      drawCurrentScreen();
-      refreshAllMarkets();
-      return;
-    } else if (selectedIndex == 2) mode = ScreenMode::CO2Sensor;
-    else if (selectedIndex == 3) {
-      mode = ScreenMode::WiFiSettings;
-      wifiListOpen = false;
-      wifiSelectedIndex = 0;
-      wifiTopIndex = 0;
-      pendingDeleteWifi = -1;
-    }
+    if (selectedIndex == 0) mode = ScreenMode::CO2Sensor;
+    else if (selectedIndex == 1) { mode = ScreenMode::PasswordVault; vaultSelectedIndex = 0; vaultTopIndex = 0; if (safeCodeSet) startSafe(false); else vaultPage = VaultPage::Menu; }
+    else if (selectedIndex == 2) mode = ScreenMode::AnswerBook;
+    else if (selectedIndex == 3) { mode = ScreenMode::MarketTicker; drawCurrentScreen(); refreshAllMarkets(); return; }
+    else if (selectedIndex == 4) { mode = ScreenMode::WiFiSettings; wifiListOpen = false; wifiSelectedIndex = 0; wifiTopIndex = 0; pendingDeleteWifi = -1; }
     else mode = ScreenMode::About;
     drawCurrentScreen();
-  } else if (mode == ScreenMode::AnswerBook) {
-    shuffleAnswer();
-  } else if (mode == ScreenMode::MarketTicker) {
-    refreshAllMarkets();
-  } else if (mode == ScreenMode::CO2Sensor) {
-    co2ByteCount = 0;
-    co2FrameCount = 0;
-    co2Ppm = -1;
-    co2RawFrame = "none";
-    co2Status = "counter reset";
-    jw01BufferLen = 0;
-    drawCo2Values();
-  } else if (mode == ScreenMode::WiFiSettings) {
-    handleWiFiSelect();
+    return;
   }
+  if (mode == ScreenMode::AnswerBook) shuffleAnswer();
+  else if (mode == ScreenMode::MarketTicker) refreshAllMarkets();
+  else if (mode == ScreenMode::CO2Sensor) { co2ByteCount=0;co2FrameCount=0;co2Ppm=-1;co2RawFrame="none";co2Status="counter reset";jw01BufferLen=0;drawCo2Values(); }
+  else if (mode == ScreenMode::PasswordVault) handleVaultPress();
+  else if (mode == ScreenMode::WiFiSettings) handleWiFiSelect();
 }
-
 void handleLongPress()
 {
+  if (mode == ScreenMode::PasswordVault && vaultPage == VaultPage::PairPrompt) {
+    vaultPairToken = "";
+    vaultPairExpiresAt = 0;
+    Serial.println("#PAIR_DENY");
+    vaultPage = VaultPage::Menu;
+    vaultSelectedIndex = 0;
+    vaultTopIndex = 0;
+    drawPasswordVault();
+    return;
+  }
+  if (mode == ScreenMode::PasswordVault && vaultPage == VaultPage::List) {
+    if (pendingDeleteVault >= 0) {
+      pendingDeleteVault = -1;
+      drawPasswordVault();
+      drawFooter("Delete cancelled");
+      return;
+    }
+    if (vaultSelectedIndex < vaultCount) {
+      pendingDeleteVault = vaultSelectedIndex;
+      drawPasswordVault();
+      drawFooter("Press: delete | Hold: cancel");
+      return;
+    }
+  }
+  if (mode == ScreenMode::PasswordVault && vaultPage == VaultPage::SafeDial) {
+    vaultPage = safeSettingMode ? VaultPage::SafeMenu : VaultPage::Menu;
+    vaultSelectedIndex = 0;
+    vaultTopIndex = 0;
+    drawPasswordVault();
+    return;
+  }
   if (mode == ScreenMode::WiFiSettings) {
     if (pendingDeleteWifi >= 0) {
       pendingDeleteWifi = -1;
@@ -2048,6 +2401,54 @@ void readSerialControls()
 {
   while (Serial.available()) {
     char c = Serial.read();
+    if (serialCommandBuffer.length() > 0 || c == '#') {
+      if (c == '\r') continue;
+      if (c == '\n') {
+        String command = serialCommandBuffer;
+        serialCommandBuffer = "";
+        if (command == "#PING") {
+          Serial.println("#READY|JJ1");
+        } else if (command == "#PAIR") {
+          vaultPairToken = "";
+          vaultPairExpiresAt = 0;
+          mode = ScreenMode::PasswordVault;
+          vaultPage = VaultPage::PairPrompt;
+          vaultSelectedIndex = 0;
+          vaultTopIndex = 0;
+          drawPasswordVault();
+          Serial.println("#PAIR_PROMPT");
+        } else if (command.startsWith("#SAVE|")) {
+          String fields[4];
+          int start = 6;
+          bool parsed = true;
+          for (int field = 0; field < 4; field++) {
+            int separator = command.indexOf('|', start);
+            if (field == 3) fields[field] = command.substring(start);
+            else if (separator >= 0) { fields[field] = command.substring(start, separator); start = separator + 1; }
+            else { parsed = false; break; }
+          }
+          if (!parsed || vaultPairToken.length() == 0 || fields[0] != vaultPairToken || (vaultPairExpiresAt != 0 && static_cast<int32_t>(millis() - vaultPairExpiresAt) > 0)) {
+            Serial.println("#ERROR|Pair again before saving");
+          } else {
+            String site, username, password;
+            if (!decodeBase64(fields[1], site) || !decodeBase64(fields[2], username) || !decodeBase64(fields[3], password) || site.length() == 0) {
+              Serial.println("#ERROR|Invalid credential data");
+            } else {
+              upsertVaultEntry(site, username, password);
+              Serial.println("#SAVED");
+            }
+          }
+        } else if (command == "#CLOSE") {
+          vaultPairToken = "";
+          vaultPairExpiresAt = 0;
+        }
+      } else if (serialCommandBuffer.length() < 480) {
+        serialCommandBuffer += c;
+      } else {
+        serialCommandBuffer = "";
+      }
+      continue;
+    }
     if (c == 'u' || c == 'U' || c == 'l' || c == 'L') handleRotate(-1);
     else if (c == 'd' || c == 'D' || c == 'r' || c == 'R') handleRotate(1);
     else if (c == ' ' || c == '\r' || c == '\n' || c == 's' || c == 'S') handleShortPress();
@@ -2112,7 +2513,9 @@ void updateCo2DogAnimation()
 void setup()
 {
   Serial.begin(115200);
-  delay(200);
+  keyboard.begin();
+  USB.begin();
+  delay(300);
 
   pinMode(POWER_ON_PIN, OUTPUT);
   digitalWrite(POWER_ON_PIN, HIGH);
@@ -2155,6 +2558,7 @@ void loop()
   readButton();
   readSerialControls();
   updateWiFiConnect();
+  updateSafe();
   updateMarketAnimation();
   updateMarqueeAnimation();
   updateCo2DogAnimation();
@@ -2176,4 +2580,3 @@ void loop()
                   wifiConfig.ssid.c_str());
   }
 }
-
