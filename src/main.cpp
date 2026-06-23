@@ -2534,6 +2534,7 @@ void setup()
   tft.init();
   tft.setRotation(3);
   loadConfig();
+  loadVault();
   startConfigAp();
   drawMainMenu();
 
