@@ -97,7 +97,9 @@ struct VaultEntry {
 
 struct MarketIndex {
   const char *name;
-  const char *symbol;
+  const char *yahooSymbol;
+  const char *sinaSymbol;
+  const char *stooqSymbol;
   float price;
   float changePct;
   bool valid;
@@ -400,15 +402,15 @@ const char *answerBookEntries[] = {
 constexpr int ANSWER_COUNT = sizeof(answerBookEntries) / sizeof(answerBookEntries[0]);
 
 MarketIndex markets[] = {
-  {"S&P 500", "%5EGSPC", 0, 0, false, 0, ""},
-  {"NASDAQ", "%5EIXIC", 0, 0, false, 0, ""},
-  {"Dow Jones", "%5EDJI", 0, 0, false, 0, ""},
-  {"Hang Seng", "%5EHSI", 0, 0, false, 0, ""},
-  {"Nikkei 225", "%5EN225", 0, 0, false, 0, ""},
-  {"Shanghai", "000001.SS", 0, 0, false, 0, ""},
-  {"Shenzhen", "399001.SZ", 0, 0, false, 0, ""},
-  {"DAX", "%5EGDAXI", 0, 0, false, 0, ""},
-  {"FTSE 100", "%5EFTSE", 0, 0, false, 0, ""}
+  {"S&P 500", "%5EGSPC", "gb_inx", "%5Espx", 0, 0, false, 0, ""},
+  {"NASDAQ", "%5EIXIC", "gb_ixic", "%5Eixic", 0, 0, false, 0, ""},
+  {"Dow Jones", "%5EDJI", "gb_dji", "%5Edji", 0, 0, false, 0, ""},
+  {"Hang Seng", "%5EHSI", "rt_hkHSI", "%5Ehsi", 0, 0, false, 0, ""},
+  {"Nikkei 225", "%5EN225", "int_nikkei", "%5Enkx", 0, 0, false, 0, ""},
+  {"Shanghai", "000001.SS", "s_sh000001", "000001", 0, 0, false, 0, ""},
+  {"Shenzhen", "399001.SZ", "s_sz399001", "399001", 0, 0, false, 0, ""},
+  {"DAX", "%5EGDAXI", "int_dax", "%5Edax", 0, 0, false, 0, ""},
+  {"FTSE 100", "%5EFTSE", "int_ftse", "%5Eukx", 0, 0, false, 0, ""}
 };
 constexpr int MARKET_COUNT = sizeof(markets) / sizeof(markets[0]);
 
@@ -1789,33 +1791,57 @@ float parseJsonNumber(const String &body, const char *key, bool &ok)
   return body.substring(at, end).toFloat();
 }
 
-bool fetchMarket(MarketIndex &market)
+String csvField(const String &line, int index)
 {
-  if (WiFi.status() != WL_CONNECTED) {
-    market.error = "offline";
-    return false;
+  int start = 0;
+  for (int i = 0; i < index; i++) {
+    start = line.indexOf(',', start);
+    if (start < 0) return "";
+    start++;
   }
+  int end = line.indexOf(',', start);
+  if (end < 0) end = line.length();
+  return line.substring(start, end);
+}
 
+String quotedPayload(const String &body)
+{
+  int first = body.indexOf('"');
+  int last = body.lastIndexOf('"');
+  if (first < 0 || last <= first) return "";
+  return body.substring(first + 1, last);
+}
+
+bool assignMarketValue(MarketIndex &market, float price, float pct, const char *source)
+{
+  if (isnan(price) || price == 0) return false;
+  market.price = price;
+  market.changePct = pct;
+  market.valid = true;
+  market.updatedAt = millis();
+  market.error = source;
+  return true;
+}
+
+bool fetchMarketYahoo(MarketIndex &market)
+{
   WiFiClientSecure client;
   client.setInsecure();
 
   HTTPClient http;
   String url = "https://query1.finance.yahoo.com/v8/finance/chart/";
-  url += market.symbol;
+  url += market.yahooSymbol;
   url += "?range=1d&interval=1d";
 
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setUserAgent("Mozilla/5.0 ESP32-S3");
   http.setTimeout(6500);
 
-  if (!http.begin(client, url)) {
-    market.error = "http";
-    return false;
-  }
+  if (!http.begin(client, url)) return false;
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    market.error = String(code);
+    market.error = "Y" + String(code);
     http.end();
     return false;
   }
@@ -1831,25 +1857,96 @@ bool fetchMarket(MarketIndex &market)
   float previousClose = parseJsonNumber(body, "\"chartPreviousClose\"", okPrev);
   if (!okPrev) previousClose = parseJsonNumber(body, "\"previousClose\"", okPrev);
   if (!okPrev) previousClose = parseJsonNumber(body, "\"regularMarketPreviousClose\"", okPrev);
-  if (!okPrice) {
-    market.error = "parse";
+  if (!okPrice) return false;
+  if (!okPct && okPrev && previousClose != 0) pct = (price - previousClose) * 100.0f / previousClose;
+  if (!okPct && (!okPrev || previousClose == 0)) pct = NAN;
+  return assignMarketValue(market, price, pct, "Y");
+}
+
+bool fetchMarketSina(MarketIndex &market)
+{
+  if (!market.sinaSymbol || !market.sinaSymbol[0]) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://hq.sinajs.cn/list=";
+  url += market.sinaSymbol;
+  http.setUserAgent("Mozilla/5.0 ESP32-S3");
+  http.setTimeout(5000);
+
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    market.error = "S" + String(code);
+    http.end();
     return false;
   }
 
-  market.price = price;
-  if (okPct) {
-    market.changePct = pct;
-  } else if (okPrev && previousClose != 0) {
-    market.changePct = (price - previousClose) * 100.0f / previousClose;
-  } else {
-    market.changePct = NAN;
+  String body = http.getString();
+  http.end();
+  String payload = quotedPayload(body);
+  if (!payload.length()) return false;
+
+  float price = csvField(payload, 1).toFloat();
+  float pct = csvField(payload, 3).toFloat();
+  if (price == 0) {
+    price = csvField(payload, 3).toFloat();
+    pct = csvField(payload, 2).toFloat();
   }
-  market.valid = true;
-  market.error = "";
-  market.updatedAt = millis();
-  return true;
+  if (price == 0) return false;
+  return assignMarketValue(market, price, pct, "S");
 }
 
+bool fetchMarketStooq(MarketIndex &market)
+{
+  if (!market.stooqSymbol || !market.stooqSymbol[0]) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String url = "https://stooq.com/q/l/?s=";
+  url += market.stooqSymbol;
+  url += "&f=sd2t2ohlcvn&e=csv";
+  http.setUserAgent("Mozilla/5.0 ESP32-S3");
+  http.setTimeout(6500);
+
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    market.error = "T" + String(code);
+    http.end();
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+  int lineStart = body.indexOf('\n');
+  if (lineStart < 0 || lineStart + 1 >= (int)body.length()) return false;
+  String line = body.substring(lineStart + 1);
+  int lineEnd = line.indexOf('\n');
+  if (lineEnd >= 0) line = line.substring(0, lineEnd);
+  float openPrice = csvField(line, 3).toFloat();
+  float closePrice = csvField(line, 6).toFloat();
+  if (closePrice == 0) return false;
+  float pct = NAN;
+  if (openPrice != 0) pct = (closePrice - openPrice) * 100.0f / openPrice;
+  return assignMarketValue(market, closePrice, pct, "T");
+}
+
+bool fetchMarket(MarketIndex &market)
+{
+  if (WiFi.status() != WL_CONNECTED) {
+    market.error = "offline";
+    return false;
+  }
+
+  market.valid = false;
+  market.error = "no-src";
+  if (fetchMarketYahoo(market)) return true;
+  if (fetchMarketSina(market)) return true;
+  if (fetchMarketStooq(market)) return true;
+  return false;
+}
 void refreshOneMarket(bool force)
 {
   if (mode != ScreenMode::MarketTicker && !force) return;
