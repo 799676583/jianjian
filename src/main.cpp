@@ -53,6 +53,13 @@ constexpr uint32_t SAFE_DOUBLE_MS = 420;
 constexpr int MAIN_MENU_VISIBLE_ROWS = 5;
 constexpr int WIFI_VISIBLE_ROWS = 5;
 constexpr byte DNS_PORT = 53;
+constexpr const char *SETUP_AP_SSID = "Jianjian-Setup";
+constexpr const char *SETUP_AP_PASS = "12345678";
+constexpr int SETUP_AP_CHANNEL = 1;
+constexpr uint8_t WIFI_JOIN_OPEN = 0;
+constexpr uint8_t WIFI_JOIN_PERSONAL = 1;
+constexpr uint8_t WIFI_JOIN_PORTAL = 2;
+constexpr uint8_t WIFI_JOIN_ENTERPRISE = 3;
 IPAddress apIP(192, 168, 4, 1);
 
 enum class ScreenMode {
@@ -79,6 +86,7 @@ struct WiFiConfig {
   String username;
   String password;
   bool enterprise;
+  uint8_t joinType;
 };
 
 struct VaultEntry {
@@ -429,6 +437,15 @@ int marketScrollY = 0;
 int marketFetchIndex = 0;
 ScannedNetwork scannedNetworks[24];
 int scannedNetworkCount = 0;
+bool wifiScanInProgress = false;
+bool wifiUiDirty = true;
+uint32_t wifiScanStartedAt = 0;
+uint32_t wifiScanNextReportAt = 0;
+uint32_t lastWiFiUiRefresh = 0;
+uint32_t lastApHealthCheck = 0;
+uint32_t lastApStartAttempt = 0;
+String wifiLogLines[8];
+uint8_t wifiLogCount = 0;
 
 uint8_t encoderState = 0;
 int8_t encoderAccumulator = 0;
@@ -465,7 +482,12 @@ uint32_t safeLastMoveAt = 0;
 uint32_t safeConfirmAt = 0;
 bool connectingWiFi = false;
 bool configApRunning = false;
+bool configPortalStarted = false;
+bool configRoutesRegistered = false;
+bool wifiRadioInitialized = false;
 bool autoWiFiConnect = false;
+bool autoWiFiPending = false;
+uint32_t autoWiFiReadyAt = 0;
 bool wifiInstructionOpen = false;
 VaultPage vaultPage = VaultPage::Menu;
 ScreenMode vaultReturnMode = ScreenMode::MainMenu;
@@ -474,6 +496,10 @@ uint32_t vaultPairExpiresAt = 0;
 int autoWiFiBaseIndex = 0;
 int autoWiFiAttempt = 0;
 String statusLine = "Ready";
+String portalRedirectUrl;
+String portalProbeStatus;
+bool portalCheckPending = false;
+uint32_t portalCheckReadyAt = 0;
 int co2Ppm = -1;
 uint32_t co2FrameCount = 0;
 uint32_t co2ByteCount = 0;
@@ -492,6 +518,11 @@ void drawCo2DogAvatar();
 void setJw01Baud(uint8_t index);
 void startConfigAp();
 void connectWiFi(bool showSettings = true, bool autoMode = false);
+void updateWiFiScan();
+void addWiFiLog(const String &message);
+String makeWiFiDiagnostics();
+void handleSetupNetworks();
+void refreshWiFiSettingsIfNeeded();
 void drawPasswordVault();
 void drawSafeDial(bool entering=false);
 
@@ -562,6 +593,22 @@ uint16_t uiMint() { return tft.color565(128, 226, 205); }
 uint16_t uiLemon() { return tft.color565(255, 224, 128); }
 uint16_t uiCoral() { return tft.color565(255, 122, 132); }
 
+uint8_t effectiveWiFiJoinType(const WiFiConfig &config)
+{
+  if (config.joinType <= WIFI_JOIN_ENTERPRISE) return config.joinType;
+  return config.enterprise ? WIFI_JOIN_ENTERPRISE : WIFI_JOIN_PERSONAL;
+}
+
+const char *wifiJoinTypeLabel(uint8_t joinType)
+{
+  switch (joinType) {
+    case WIFI_JOIN_OPEN: return "Open";
+    case WIFI_JOIN_PERSONAL: return "Personal";
+    case WIFI_JOIN_PORTAL: return "Portal";
+    case WIFI_JOIN_ENTERPRISE: return "Enterprise";
+    default: return "Personal";
+  }
+}
 void saveWifiList()
 {
   prefs.begin("ui", false);
@@ -573,11 +620,13 @@ void saveWifiList()
       prefs.putString(("u" + suffix).c_str(), savedWiFis[i].username);
       prefs.putString(("p" + suffix).c_str(), savedWiFis[i].password);
       prefs.putBool(("e" + suffix).c_str(), savedWiFis[i].enterprise);
+      prefs.putUChar(("t" + suffix).c_str(), effectiveWiFiJoinType(savedWiFis[i]));
     } else {
       prefs.remove(("s" + suffix).c_str());
       prefs.remove(("u" + suffix).c_str());
       prefs.remove(("p" + suffix).c_str());
       prefs.remove(("e" + suffix).c_str());
+      prefs.remove(("t" + suffix).c_str());
     }
   }
 
@@ -585,6 +634,7 @@ void saveWifiList()
   prefs.putString("user", wifiConfig.username);
   prefs.putString("pass", wifiConfig.password);
   prefs.putBool("ent", wifiConfig.enterprise);
+  prefs.putUChar("type", effectiveWiFiJoinType(wifiConfig));
   prefs.end();
 }
 
@@ -638,6 +688,7 @@ void loadConfig()
       savedWiFis[i].username = prefs.getString(("u" + suffix).c_str(), "");
       savedWiFis[i].password = prefs.getString(("p" + suffix).c_str(), "");
       savedWiFis[i].enterprise = prefs.getBool(("e" + suffix).c_str(), false);
+      savedWiFis[i].joinType = prefs.getUChar(("t" + suffix).c_str(), savedWiFis[i].enterprise ? WIFI_JOIN_ENTERPRISE : WIFI_JOIN_PERSONAL);
     }
   }
 
@@ -645,6 +696,7 @@ void loadConfig()
   wifiConfig.username = prefs.getString("user", "");
   wifiConfig.password = prefs.getString("pass", "");
   wifiConfig.enterprise = prefs.getBool("ent", false);
+  wifiConfig.joinType = prefs.getUChar("type", wifiConfig.enterprise ? WIFI_JOIN_ENTERPRISE : WIFI_JOIN_PERSONAL);
   prefs.end();
 
   if (savedWiFiCount == 0 && wifiConfig.ssid.length() > 0) {
@@ -743,7 +795,7 @@ void clearConfig()
   wifiInstructionOpen = false;
   wifiSelectedIndex = 0;
   wifiTopIndex = 0;
-  wifiConfig = {"", "", "", false};
+  wifiConfig = {"", "", "", false, WIFI_JOIN_PERSONAL};
 }
 
 void deleteSavedWiFi(int savedIndex)
@@ -753,7 +805,7 @@ void deleteSavedWiFi(int savedIndex)
   for (int i = savedIndex + 1; i < savedWiFiCount; i++) savedWiFis[i - 1] = savedWiFis[i];
   savedWiFiCount--;
   if (wifiConfig.ssid == removed) {
-    wifiConfig = savedWiFiCount > 0 ? savedWiFis[0] : WiFiConfig{"", "", "", false};
+    wifiConfig = savedWiFiCount > 0 ? savedWiFis[0] : WiFiConfig{"", "", "", false, WIFI_JOIN_PERSONAL};
   }
   pendingDeleteWifi = -1;
   int count = wifiListOpen ? savedWiFiCount + 1 : 3;
@@ -828,7 +880,8 @@ String wifiItemLabel(int index)
     int savedIndex = wifiSavedIndex(index);
     if (pendingDeleteWifi == savedIndex) return "Delete? " + savedWiFis[savedIndex].ssid;
     String label = savedWiFis[savedIndex].ssid;
-    if (savedWiFis[savedIndex].enterprise) label += " / campus";
+    label += " / ";
+    label += wifiJoinTypeLabel(effectiveWiFiJoinType(savedWiFis[savedIndex]));
     if (WiFi.status() == WL_CONNECTED && wifiConfig.ssid == savedWiFis[savedIndex].ssid) label += " / online";
     return label;
   }
@@ -944,17 +997,21 @@ String encryptionLabel(wifi_auth_mode_t type)
 String makeNetworkOptions()
 {
   String options;
+  bool matchedCurrent = false;
   if (scannedNetworkCount <= 0) {
     options += F("<option value=\"\">Tap Refresh Network List</option>");
   } else {
     for (int i = 0; i < scannedNetworkCount; i++) {
       String ssid = scannedNetworks[i].ssid;
+      if (ssid.length() == 0) continue;
+      bool selected = ssid == wifiConfig.ssid;
+      if (selected) matchedCurrent = true;
       options += F("<option value=\"");
       options += htmlEscape(ssid);
       options += F("\"");
-      if (ssid == wifiConfig.ssid) options += F(" selected");
+      if (selected) options += F(" selected");
       options += F(">");
-      options += htmlEscape(ssid.length() ? ssid : String("(hidden)"));
+      options += htmlEscape(ssid);
       options += F(" / ");
       options += String(scannedNetworks[i].rssi);
       options += F(" dBm / ");
@@ -965,14 +1022,104 @@ String makeNetworkOptions()
   return options;
 }
 
+void addWiFiLog(const String &message)
+{
+  String entry = String(millis() / 1000) + "s " + message;
+  Serial.println("[WiFi] " + entry);
+  if (wifiLogCount < 8) {
+    wifiLogLines[wifiLogCount++] = entry;
+  } else {
+    for (int i = 0; i < 7; i++) wifiLogLines[i] = wifiLogLines[i + 1];
+    wifiLogLines[7] = entry;
+  }
+  wifiUiDirty = true;
+}
+
+String makeWiFiDiagnostics()
+{
+  String html;
+  html += "AP=" + String(configApRunning ? "on" : "off");
+  html += "  STA status=" + String((int)WiFi.status());
+  html += "  mode=" + String((int)WiFi.getMode());
+  html += "  scan=" + String(wifiScanInProgress ? "running" : "idle");
+  html += "<br>AP clients=" + String(WiFi.softAPgetStationNum());
+  html += "  AP IP=" + WiFi.softAPIP().toString();
+  html += "<br><b>Recent events</b>";
+  for (uint8_t i = 0; i < wifiLogCount; i++) {
+    html += "<br>" + htmlEscape(wifiLogLines[i]);
+  }
+  return html;
+}
 void scanNearbyNetworks()
 {
-  statusLine = "Scanning WiFi...";
-  scannedNetworkCount = 0;
-  int count = WiFi.scanNetworks(false, true);
-  if (count <= 0) {
-    statusLine = "No WiFi found";
+  if (wifiScanInProgress) {
+    statusLine = "Scanning WiFi...";
+    addWiFiLog("scan ignored: already running");
+    return;
+  }
+
+  // The radio cannot reliably scan while a prior STA association attempt is
+  // still active. Abort that attempt without touching the AP interface.
+  if (connectingWiFi) WiFi.disconnect(false, false);
+  connectingWiFi = false;
+  autoWiFiConnect = false;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  wifiUiDirty = true;
+  addWiFiLog("scan request: mode=" + String((int)WiFi.getMode()) + " sta=" + String((int)WiFi.status()));
+  WiFi.scanDelete();
+
+  // Active scans are markedly more reliable than passive scans on this S3
+  // while its AP is beaconing on channel 1.
+  int scanState = WiFi.scanNetworks(true, true, false, 300);
+  if (scanState == WIFI_SCAN_RUNNING) {
+    scannedNetworkCount = 0;
+    wifiScanInProgress = true;
+    wifiScanStartedAt = millis();
+    wifiScanNextReportAt = wifiScanStartedAt + 3000;
+    statusLine = "Scanning WiFi...";
+    addWiFiLog("scan started");
+    return;
+  }
+
+  WiFi.scanDelete();
+  statusLine = "WiFi scan start error " + String(scanState);
+  addWiFiLog("scan start error=" + String(scanState));
+}
+
+void updateWiFiScan()
+{
+  if (!wifiScanInProgress) return;
+
+  int count = WiFi.scanComplete();
+  if (count == WIFI_SCAN_RUNNING) {
+    if (millis() >= wifiScanNextReportAt) {
+      addWiFiLog("scan running " + String((millis() - wifiScanStartedAt) / 1000) + "s");
+      wifiScanNextReportAt += 3000;
+    }
+    if (millis() - wifiScanStartedAt > 20000) {
+      wifiScanInProgress = false;
+      WiFi.scanDelete();
+      statusLine = "WiFi scan timeout";
+      addWiFiLog("scan timeout");
+      wifiUiDirty = true;
+    }
+    return;
+  }
+
+  wifiScanInProgress = false;
+  if (count < 0) {
+    statusLine = "WiFi scan result error " + String(count);
+    addWiFiLog("scan result error=" + String(count));
     WiFi.scanDelete();
+    wifiUiDirty = true;
+    return;
+  }
+  if (count == 0) {
+    statusLine = "No 2.4G WiFi found";
+    addWiFiLog("scan completed: 0 networks");
+    WiFi.scanDelete();
+    wifiUiDirty = true;
     return;
   }
 
@@ -984,8 +1131,9 @@ void scanNearbyNetworks()
   }
   WiFi.scanDelete();
   statusLine = "Scan found " + String(scannedNetworkCount);
+  addWiFiLog("scan completed: " + String(scannedNetworkCount) + " networks");
+  wifiUiDirty = true;
 }
-
 String answerText(int index)
 {
   index = ((index % ANSWER_COUNT) + ANSWER_COUNT) % ANSWER_COUNT;
@@ -1517,16 +1665,16 @@ void drawWiFiSettings()
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(uiMuted(), uiBg());
   if (wifiInstructionOpen) {
-    tft.drawString("1. Join Jianjian-Setup", 8, 42, 2);
-    tft.drawString("2. Password 12345678", 8, 62, 2);
+    tft.drawString(String("1. Join ") + SETUP_AP_SSID, 8, 42, 2);
+    tft.drawString(String("2. Password ") + SETUP_AP_PASS, 8, 62, 2);
     tft.drawString("3. Open 192.168.4.1", 8, 82, 2);
     tft.drawString("4. Pick WiFi and save", 8, 102, 2);
     tft.setTextColor(uiText(), uiBg());
-    tft.drawString("Campus WiFi: use", 8, 126, 2);
-    tft.drawString("username + password", 8, 144, 2);
+    tft.drawString("Enterprise: user/pass", 8, 126, 2);
+    tft.drawString("Portal: web login", 8, 144, 2);
   } else if (!wifiListOpen) {
-    tft.drawString("AP: Jianjian-Setup", 8, 42, 2);
-    tft.drawString("Pass: 12345678", 8, 62, 2);
+    tft.drawString(String("AP: ") + SETUP_AP_SSID, 8, 42, 2);
+    tft.drawString(String("Pass: ") + SETUP_AP_PASS, 8, 62, 2);
     tft.drawString("Portal: 192.168.4.1", 8, 82, 2);
 
     tft.setTextColor(uiText(), uiBg());
@@ -1545,6 +1693,12 @@ void drawWiFiSettings()
 
   drawWiFiRows();
 
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(uiMuted(), uiBg());
+  String latestLog = wifiLogCount ? wifiLogLines[wifiLogCount - 1] : "WiFi log waiting";
+  tft.fillRect(4, 132, 150, 17, uiBg());
+  tft.drawString("LOG " + latestLog.substring(0, 28), 8, 132, 1);
+  tft.drawString("M" + String((int)WiFi.getMode()) + " CH" + String(SETUP_AP_CHANNEL) + " STA" + String(WiFi.softAPgetStationNum()), 8, 142, 1);
   String wifi = WiFi.status() == WL_CONNECTED ? "STA " + WiFi.localIP().toString() : statusLine;
   if (pendingDeleteWifi >= 0) wifi = "Press to delete, hold to cancel";
   drawFooter(wifi);
@@ -1879,13 +2033,16 @@ void beginNormalWiFi()
   WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect(false, false);
   delay(200);
-  WiFi.begin(wifiConfig.ssid.c_str(), wifiConfig.password.c_str());
+  uint8_t joinType = effectiveWiFiJoinType(wifiConfig);
+  if (joinType == WIFI_JOIN_OPEN || wifiConfig.password.length() == 0) WiFi.begin(wifiConfig.ssid.c_str());
+  else WiFi.begin(wifiConfig.ssid.c_str(), wifiConfig.password.c_str());
 }
 
 void connectWiFi(bool showSettings, bool autoMode)
 {
   if (wifiConfig.ssid.length() == 0) {
     statusLine = "SSID empty";
+    wifiUiDirty = true;
     drawWiFiSettings();
     return;
   }
@@ -1894,15 +2051,18 @@ void connectWiFi(bool showSettings, bool autoMode)
   connectingWiFi = true;
   wifiConnectStarted = millis();
   statusLine = autoMode ? ("Auto WiFi " + String(autoWiFiAttempt + 1) + "/" + String(max(1, savedWiFiCount))) : "Connecting...";
+  wifiUiDirty = true;
   if (showSettings) drawWiFiSettings();
   else drawCurrentScreen();
 
-  Serial.printf("WiFi connect start: ssid=%s enterprise=%d user=%s\n",
+  uint8_t joinType = effectiveWiFiJoinType(wifiConfig);
+  Serial.printf("WiFi connect start: ssid=%s type=%u enterprise=%d user=%s\n",
                 wifiConfig.ssid.c_str(),
+                joinType,
                 wifiConfig.enterprise,
                 wifiConfig.username.c_str());
 
-  if (wifiConfig.enterprise) beginEnterpriseWiFi();
+  if (joinType == WIFI_JOIN_ENTERPRISE) beginEnterpriseWiFi();
   else beginNormalWiFi();
 }
 
@@ -1915,7 +2075,13 @@ void updateWiFiConnect()
     autoWiFiConnect = false;
     statusLine = "Connected";
     saveConfig();
+    wifiUiDirty = true;
     Serial.printf("WiFi connected: ip=%s rssi=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    if (effectiveWiFiJoinType(wifiConfig) == WIFI_JOIN_PORTAL) {
+      portalCheckPending = true;
+      portalCheckReadyAt = millis() + 1500;
+      statusLine = "Connected; checking portal";
+    }
     if (mode == ScreenMode::WiFiSettings || mode == ScreenMode::MainMenu) drawCurrentScreen();
     return;
   }
@@ -1937,38 +2103,95 @@ void updateWiFiConnect()
     connectingWiFi = false;
     autoWiFiConnect = false;
     statusLine = "Failed code " + String((int)status);
+    wifiUiDirty = true;
     if (mode == ScreenMode::WiFiSettings || mode == ScreenMode::MainMenu) drawCurrentScreen();
   }
 }
 
 String checkUpstreamPortal()
 {
-  if (WiFi.status() != WL_CONNECTED) return "ESP32 is not connected to upstream WiFi.";
-
-  WiFiClient client;
-  HTTPClient http;
-  http.setTimeout(5000);
-  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-  if (!http.begin(client, "http://connectivitycheck.gstatic.com/generate_204")) {
-    return "Portal check failed to start.";
+  portalRedirectUrl = "";
+  portalProbeStatus = "";
+  if (WiFi.status() != WL_CONNECTED) {
+    portalProbeStatus = "ESP32 is not connected to upstream WiFi.";
+    return portalProbeStatus;
   }
 
-  int code = http.GET();
-  String location = http.header("Location");
-  http.end();
+  struct PortalProbe {
+    const char *url;
+    const char *openMarker;
+    int openCode;
+  };
+  const PortalProbe probes[] = {
+    {"http://connectivitycheck.gstatic.com/generate_204", "", 204},
+    {"http://www.gstatic.com/generate_204", "", 204},
+    {"http://captive.apple.com/hotspot-detect.html", "Success", 200},
+    {"http://www.msftconnecttest.com/connecttest.txt", "Microsoft Connect Test", 200},
+    {"http://neverssl.com/", "NeverSSL", 200}
+  };
 
-  if (code == 204) return "Internet looks open; no captive portal detected.";
-  if (code >= 300 && code < 400 && location.length()) {
-    return "Captive portal redirect detected: " + location;
+  String lastResult;
+  for (const PortalProbe &probe : probes) {
+    WiFiClient client;
+    HTTPClient http;
+    const char *headers[] = {"Location"};
+    http.setTimeout(5000);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.collectHeaders(headers, 1);
+    if (!http.begin(client, probe.url)) {
+      lastResult = "begin failed: " + String(probe.url);
+      continue;
+    }
+
+    int code = http.GET();
+    String location = http.header("Location");
+    String body;
+    if (code > 0) body = http.getString().substring(0, 240);
+    http.end();
+
+    lastResult = String(probe.url) + " code=" + String(code);
+    if (location.length()) lastResult += " location=" + location;
+
+    if (code >= 300 && code < 400 && location.length()) {
+      portalRedirectUrl = location;
+      portalProbeStatus = "Captive portal redirect detected.";
+      return portalProbeStatus;
+    }
+
+    if (code == probe.openCode && (strlen(probe.openMarker) == 0 || body.indexOf(probe.openMarker) >= 0)) {
+      portalProbeStatus = "Internet looks open; no captive portal detected.";
+      return portalProbeStatus;
+    }
+
+    if (code == 200 && body.length()) {
+      String lower = body;
+      lower.toLowerCase();
+      if (lower.indexOf("login") >= 0 || lower.indexOf("password") >= 0 || lower.indexOf("portal") >= 0 || lower.indexOf("认证") >= 0) {
+        portalRedirectUrl = probe.url;
+        portalProbeStatus = "Portal page detected without Location header.";
+        return portalProbeStatus;
+      }
+    }
   }
-  if (code > 0) return "Unexpected portal check HTTP code: " + String(code);
-  return "Portal check request failed.";
+
+  portalProbeStatus = "No portal link found. Last probe: " + lastResult;
+  return portalProbeStatus;
 }
-
+bool currentWiFiSsidInScan()
+{
+  if (wifiConfig.ssid.length() == 0) return false;
+  for (int i = 0; i < scannedNetworkCount; i++) {
+    if (scannedNetworks[i].ssid == wifiConfig.ssid) return true;
+  }
+  return false;
+}
 String makeSetupPage()
 {
   String page;
-  page.reserve(7200);
+  page.reserve(9400);
+  uint8_t currentJoinType = effectiveWiFiJoinType(wifiConfig);
+  bool currentSsidIsScanned = currentWiFiSsidInScan();
+  bool currentIsHiddenPersonal = currentJoinType == WIFI_JOIN_PERSONAL && wifiConfig.ssid.length() > 0 && !currentSsidIsScanned;
   page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
   page += F("<title>ESP32 WiFi Setup</title><style>");
   page += F("body{margin:0;background:#101318;color:#f4f7fb;font-family:system-ui,Segoe UI,sans-serif}main{max-width:520px;margin:0 auto;padding:18px}");
@@ -1979,26 +2202,46 @@ String makeSetupPage()
   page += htmlEscape(statusLine);
   page += F("</div><div class='muted'>STA IP: ");
   page += WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("offline");
-  page += F("</div><div class='muted'>AP IP: 192.168.4.1</div><a href='/scan'><button class='secondary'>Refresh Network List</button></a>");
+  page += F("</div><div class='muted'>AP IP: 192.168.4.1</div><button id='scanBtn' class='secondary' type='button' onclick='startScan()'>Refresh Network List</button><div id='scanHint' class='muted'></div>");
+  page += F("</div></section><section class='panel'><div class='muted' id='diagnostics'>");
+  page += makeWiFiDiagnostics();
   page += F("</div></section><form method='post' action='/save' class='panel'>");
-  page += F("<label>Nearby WiFi</label><select name='picked_ssid'>");
-  page += makeNetworkOptions();
-  page += F("</select><label>SSID / Hidden Network</label><input name='ssid' value=\"");
-  page += htmlEscape(wifiConfig.ssid);
-  page += F("\" placeholder='Leave empty to use selected network'><label>Login type</label><select name='enterprise'>");
+  page += F("<label>WiFi security type</label><select id='joinType' name='join_type' onchange='updateFields()'>");
   page += F("<option value='0'");
-  if (!wifiConfig.enterprise) page += F(" selected");
-  page += F(">Normal WiFi password / open portal</option><option value='1'");
-  if (wifiConfig.enterprise) page += F(" selected");
-  page += F(">Campus / WPA2-Enterprise, such as UM_SECURED_WLAN</option></select>");
-  page += F("<label>Username / Identity</label><input name='username' value=\"");
+  if (currentJoinType == WIFI_JOIN_OPEN) page += F(" selected");
+  page += F(">Open network, no password</option><option value='1'");
+  if (currentJoinType == WIFI_JOIN_PERSONAL) page += F(" selected");
+  page += F(">WPA/WPA2/WPA3 Personal, SSID + password</option><option value='2'");
+  if (currentJoinType == WIFI_JOIN_PORTAL) page += F(" selected");
+  page += F(">Captive Portal / Web login, no WiFi password</option><option value='3'");
+  if (currentJoinType == WIFI_JOIN_ENTERPRISE) page += F(" selected");
+  page += F(">WPA2-Enterprise 802.1X, username + password</option></select><p class='muted' id='typeHelp'></p>");
+  page += F("<div id='networkWrap'><label>Network</label><select id='ssidList' name='picked_ssid' onchange='onNetworkChange()'>");
+  page += makeNetworkOptions();
+  page += F("</select></div><div id='hiddenToggleWrap'><label><input id='hiddenToggle' name='hidden_network' type='checkbox' value='1' onchange='onHiddenToggle()'");
+  if (currentIsHiddenPersonal) page += F(" checked");
+  page += F("> Hidden network</label></div><div id='hiddenSsidWrap'><label>Hidden SSID</label><input id='hiddenSsidInput' name='hidden_ssid' value=\"");
+  if (currentIsHiddenPersonal) page += htmlEscape(wifiConfig.ssid);
+  page += F("\" placeholder='Enter hidden network SSID'></div>");
+  page += F("<div id='usernameWrap'><label>Username / Identity</label><input id='usernameInput' name='username' value=\"");
   page += htmlEscape(wifiConfig.username);
-  page += F("\"><label>Password</label><input name='password' type='password' value=\"");
+  page += F("\"></div><div id='passwordWrap'><label id='passwordLabel'>Password</label><input id='passwordInput' name='password' type='password' value=\"");
   page += htmlEscape(wifiConfig.password);
-  page += F("\"><button type='submit'>Save and Connect ESP32</button></form>");
+  page += F("\"></div><button type='submit'>Save and Connect ESP32</button></form>");
   page += F("<section class='panel'><a href='/portalcheck'><button class='secondary'>Check Upstream Portal</button></a>");
-  page += F("<p class='muted'>If the upstream WiFi uses a web portal after connection, this can detect the redirect. Full phone-side portal forwarding needs ESP32 NAT/router mode, so this demo does not transparently pass your phone through yet.</p></section>");
-  page += F("<section class='panel'><p class='muted'>Phone should auto-open this page after joining AP ESP32-Setup / 12345678. If it does not, open 192.168.4.1 manually.</p></section></main></body></html>");
+  if (portalRedirectUrl.length()) {
+    page += F("<a href=\"");
+    page += htmlEscape(portalRedirectUrl);
+    page += F("\"><button type='button'>Open Login Page</button></a><p class='muted'>Detected portal: ");
+    page += htmlEscape(portalRedirectUrl);
+    page += F("</p>");
+  } else if (portalProbeStatus.length()) {
+    page += F("<p class='muted'>Portal status: ");
+    page += htmlEscape(portalProbeStatus);
+    page += F("</p>");
+  }
+  page += F("<p class='muted'>Portal forwarding needs NAT/router support. This build can detect and show the login URL, but cannot transparently proxy HTTPS portal pages.</p></section>");
+  page += F("<section class='panel'><p class='muted'>Phone should auto-open this page after joining AP Jianjian-Setup / 12345678. If it does not, open 192.168.4.1 manually.</p></section><script>function updateFields(){var t=document.getElementById('joinType').value,s=document.getElementById('ssidList'),nw=document.getElementById('networkWrap'),ht=document.getElementById('hiddenToggle'),htw=document.getElementById('hiddenToggleWrap'),hw=document.getElementById('hiddenSsidWrap'),hi=document.getElementById('hiddenSsidInput'),u=document.getElementById('usernameWrap'),p=document.getElementById('passwordWrap'),pi=document.getElementById('passwordInput'),ui=document.getElementById('usernameInput'),h=document.getElementById('typeHelp'),pl=document.getElementById('passwordLabel'),hidden=t==='1'&&ht&&ht.checked;if(htw)htw.style.display=(t==='1')?'block':'none';if(nw)nw.style.display=hidden?'none':'block';if(hw)hw.style.display=hidden?'block':'none';if(hi)hi.required=hidden;u.style.display=(t==='3')?'block':'none';p.style.display=(t==='0'||t==='2')?'none':'block';ui.required=(t==='3');pi.required=(t==='1'||t==='3');pl.textContent='Password';if(t==='2'&&pi)pi.value='';h.textContent=t==='0'?'Open WiFi: choose a network, no password needed.':t==='1'?'Personal WiFi: choose SSID and password, or check Hidden network to type SSID.':t==='2'?'Captive portal: choose SSID, then use the detected portal link below.':'Enterprise 802.1X: choose SSID, then enter identity/username and password.';}function clearCredentialFields(){var ui=document.getElementById('usernameInput'),pi=document.getElementById('passwordInput');if(ui)ui.value='';if(pi)pi.value='';}function onNetworkChange(){clearCredentialFields();updateFields();}function onHiddenToggle(){clearCredentialFields();updateFields();}function refreshNetworks(){var s=document.getElementById('ssidList'),keep=s?s.value:'';return fetch('/networks').then(function(r){return r.text();}).then(function(t){if(!s)return;s.innerHTML=t;if(keep){var found=false;for(var i=0;i<s.options.length;i++){if(s.options[i].value===keep){found=true;break;}}if(found)s.value=keep;}updateFields();});}function startScan(){var b=document.getElementById('scanBtn'),h=document.getElementById('scanHint');b.disabled=true;b.textContent='Scanning...';h.textContent='Looking for nearby 2.4 GHz WiFi...';fetch('/scan').then(function(){return refreshNetworks();}).then(function(){setTimeout(function(){b.disabled=false;b.textContent='Refresh Network List';},600);}).catch(function(){b.disabled=false;b.textContent='Refresh Network List';h.textContent='Scan request failed. Try again.';});}updateFields();setInterval(function(){fetch('/diagnostics').then(function(r){return r.text();}).then(function(t){var d=document.getElementById('diagnostics');if(d)d.innerHTML=t;});refreshNetworks();},1800);</script></main></body></html>");
   return page;
 }
 
@@ -2007,18 +2250,42 @@ void handleSetupRoot()
   server.send(200, "text/html; charset=utf-8", makeSetupPage());
 }
 
+void handleSetupDiagnostics()
+{
+  server.send(200, "text/html; charset=utf-8", makeWiFiDiagnostics());
+}
+
+void handleSetupNetworks()
+{
+  server.send(200, "text/html; charset=utf-8", makeNetworkOptions());
+}
+
 void handleSetupSave()
 {
-  String manualSsid = server.hasArg("ssid") ? server.arg("ssid") : "";
   String pickedSsid = server.hasArg("picked_ssid") ? server.arg("picked_ssid") : "";
-  manualSsid.trim();
+  String hiddenSsid = server.hasArg("hidden_ssid") ? server.arg("hidden_ssid") : "";
   pickedSsid.trim();
-  wifiConfig.ssid = manualSsid.length() ? manualSsid : pickedSsid;
-  if (server.hasArg("username")) wifiConfig.username = server.arg("username");
-  if (server.hasArg("password")) wifiConfig.password = server.arg("password");
-  wifiConfig.enterprise = server.hasArg("enterprise") && server.arg("enterprise") == "1";
+  hiddenSsid.trim();
+  uint8_t requestedType = server.hasArg("join_type") ? (uint8_t)server.arg("join_type").toInt() : WIFI_JOIN_PERSONAL;
+  if (requestedType > WIFI_JOIN_ENTERPRISE) requestedType = WIFI_JOIN_PERSONAL;
+  bool hiddenPersonal = requestedType == WIFI_JOIN_PERSONAL && server.hasArg("hidden_network");
+  wifiConfig.ssid = hiddenPersonal ? hiddenSsid : pickedSsid;
+  wifiConfig.joinType = requestedType;
+  wifiConfig.enterprise = requestedType == WIFI_JOIN_ENTERPRISE;
+  wifiConfig.username = server.hasArg("username") ? server.arg("username") : "";
+  wifiConfig.password = server.hasArg("password") ? server.arg("password") : "";
+  if (requestedType == WIFI_JOIN_OPEN) {
+    wifiConfig.username = "";
+    wifiConfig.password = "";
+  } else if (requestedType == WIFI_JOIN_PERSONAL) {
+    wifiConfig.username = "";
+  } else if (requestedType == WIFI_JOIN_PORTAL) {
+    wifiConfig.username = "";
+    wifiConfig.password = "";
+  }
   saveConfig();
   statusLine = "Saved from AP";
+  wifiUiDirty = true;
   connectWiFi(false);
   server.sendHeader("Location", "/");
   server.send(303);
@@ -2027,8 +2294,7 @@ void handleSetupSave()
 void handleSetupScan()
 {
   scanNearbyNetworks();
-  server.sendHeader("Location", "/");
-  server.send(303);
+  server.send(204);
 }
 
 void handlePortalCheck()
@@ -2046,24 +2312,92 @@ void handleSetupClear()
   server.send(303);
 }
 
-void startConfigAp()
+void registerConfigPortalRoutes()
 {
-  if (configApRunning) return;
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP("ESP32-Setup", "12345678", 6, false, 4);
-  dnsServer.start(DNS_PORT, "*", apIP);
+  if (configRoutesRegistered) return;
   server.on("/", HTTP_GET, handleSetupRoot);
+  server.on("/diagnostics", HTTP_GET, handleSetupDiagnostics);
+  server.on("/networks", HTTP_GET, handleSetupNetworks);
   server.on("/scan", HTTP_GET, handleSetupScan);
   server.on("/portalcheck", HTTP_GET, handlePortalCheck);
   server.on("/save", HTTP_POST, handleSetupSave);
   server.on("/clear", HTTP_POST, handleSetupClear);
   server.onNotFound(handleSetupRoot);
-  server.begin();
-  configApRunning = true;
-  statusLine = "AP 192.168.4.1";
+  configRoutesRegistered = true;
+}
+
+void startConfigAp()
+{
+  const IPAddress currentApIP = WiFi.softAPIP();
+  const bool hasAp = ((WiFi.getMode() & WIFI_AP) != 0) && currentApIP != IPAddress(0, 0, 0, 0);
+  if (hasAp) {
+    if (!configApRunning) addWiFiLog("AP recovered ip=" + currentApIP.toString());
+    configApRunning = true;
+    apIP = currentApIP;
+    return;
+  }
+
+  configApRunning = false;
+  if (lastApStartAttempt != 0 && millis() - lastApStartAttempt < 5000) return;
+  lastApStartAttempt = millis();
+
+  addWiFiLog("AP start attempt mode=" + String((int)WiFi.getMode()));
+  if (!wifiRadioInitialized) {
+    WiFi.mode(WIFI_OFF);
+    delay(180);
+    wifiRadioInitialized = true;
+  }
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  delay(80);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  bool apConfigOk = WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  addWiFiLog("AP config=" + String(apConfigOk ? "ok" : "fail"));
+  bool apStarted = WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASS, SETUP_AP_CHANNEL, false, 4);
+  if (!apStarted) {
+    addWiFiLog("AP start retry");
+    WiFi.mode(WIFI_OFF);
+    delay(180);
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    delay(80);
+    apConfigOk = WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+    addWiFiLog("AP retry config=" + String(apConfigOk ? "ok" : "fail"));
+    apStarted = WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASS, SETUP_AP_CHANNEL, false, 4);
+  }
+
+  const IPAddress startedIp = WiFi.softAPIP();
+  configApRunning = apStarted && startedIp != IPAddress(0, 0, 0, 0);
+  if (!configApRunning) {
+    statusLine = "AP start failed";
+    addWiFiLog("AP start failed");
+    wifiUiDirty = true;
+    return;
+  }
+
+  apIP = startedIp;
+  registerConfigPortalRoutes();
+  if (!configPortalStarted) {
+    server.begin();
+    configPortalStarted = true;
+  }
+  dnsServer.stop();
+  dnsServer.start(DNS_PORT, "*", apIP);
+  statusLine = String("AP: ") + SETUP_AP_SSID;
+  addWiFiLog("AP ready ip=" + apIP.toString() + " mode=" + String((int)WiFi.getMode()) + " ch=" + String(SETUP_AP_CHANNEL));
+  wifiUiDirty = true;
+}
+void refreshWiFiSettingsIfNeeded()
+{
+  if (mode != ScreenMode::WiFiSettings) return;
+  if (!wifiUiDirty) return;
+  if (millis() - lastWiFiUiRefresh < 150) return;
+  lastWiFiUiRefresh = millis();
+  wifiUiDirty = false;
+  drawWiFiSettings();
 }
 
 void handleWiFiSelect()
@@ -2075,9 +2409,17 @@ void handleWiFiSelect()
     return;
   }
 
+  if (wifiInstructionOpen) {
+    wifiInstructionOpen = false;
+    wifiSelectedIndex = 2;
+    wifiTopIndex = 0;
+    drawWiFiSettings();
+    return;
+  }
+
   if (!wifiListOpen) {
     if (wifiSelectedIndex == 0) {
-      statusLine = "AP 192.168.4.1";
+      statusLine = String("AP: ") + SETUP_AP_SSID;
       drawWiFiSettings();
       return;
     }
@@ -2087,6 +2429,14 @@ void handleWiFiSelect()
       wifiSelectedIndex = 0;
       wifiTopIndex = 0;
       pendingDeleteWifi = -1;
+      drawWiFiSettings();
+      return;
+    }
+
+    if (wifiSelectedIndex == 2) {
+      wifiInstructionOpen = true;
+      wifiSelectedIndex = 0;
+      wifiTopIndex = 0;
       drawWiFiSettings();
       return;
     }
@@ -2268,7 +2618,7 @@ void handleShortPress()
     else if (selectedIndex == 1) { mode = ScreenMode::PasswordVault; vaultSelectedIndex = 0; vaultTopIndex = 0; if (safeCodeSet) startSafe(false); else vaultPage = VaultPage::Menu; }
     else if (selectedIndex == 2) mode = ScreenMode::AnswerBook;
     else if (selectedIndex == 3) { mode = ScreenMode::MarketTicker; drawCurrentScreen(); refreshAllMarkets(); return; }
-    else if (selectedIndex == 4) { mode = ScreenMode::WiFiSettings; wifiListOpen = false; wifiSelectedIndex = 0; wifiTopIndex = 0; pendingDeleteWifi = -1; }
+    else if (selectedIndex == 4) { mode = ScreenMode::WiFiSettings; wifiListOpen = false; wifiInstructionOpen = false; wifiSelectedIndex = 0; wifiTopIndex = 0; pendingDeleteWifi = -1; }
     else mode = ScreenMode::About;
     drawCurrentScreen();
     return;
@@ -2306,13 +2656,32 @@ void handleLongPress()
     }
   }
   if (mode == ScreenMode::PasswordVault && vaultPage == VaultPage::SafeDial) {
-    vaultPage = safeSettingMode ? VaultPage::SafeMenu : VaultPage::Menu;
+    safeConfirmAt = 0;
+    safeLastMoveAt = 0;
+    safeEnteredCount = 0;
+    safeDialValue = 0;
+    safeRenderedDialValue = -1;
     vaultSelectedIndex = 0;
     vaultTopIndex = 0;
-    drawPasswordVault();
+    if (safeSettingMode) {
+      vaultPage = VaultPage::SafeMenu;
+      drawPasswordVault();
+    } else {
+      vaultPage = VaultPage::Menu;
+      mode = ScreenMode::MainMenu;
+      drawMainMenu();
+    }
     return;
   }
   if (mode == ScreenMode::WiFiSettings) {
+    if (wifiInstructionOpen) {
+      wifiInstructionOpen = false;
+      wifiSelectedIndex = 2;
+      wifiTopIndex = 0;
+      drawWiFiSettings();
+      return;
+    }
+
     if (pendingDeleteWifi >= 0) {
       pendingDeleteWifi = -1;
       statusLine = "Delete cancelled";
@@ -2408,6 +2777,8 @@ void readSerialControls()
         serialCommandBuffer = "";
         if (command == "#PING") {
           Serial.println("#READY|JJ1");
+        } else if (command == "#APSTATUS") {
+          Serial.printf("#AP|started=%d|ip=%s|stations=%d\n", configApRunning, WiFi.softAPIP().toString().c_str(), WiFi.softAPgetStationNum());
         } else if (command == "#PAIR") {
           vaultPairToken = "";
           vaultPairExpiresAt = 0;
@@ -2483,9 +2854,40 @@ void updateMarqueeAnimation()
 
   if (mode != ScreenMode::WiFiSettings) return;
 
+  if (wifiInstructionOpen) {
+    static const char *helpLines[] = {
+      "1. Join Jianjian-Setup",
+      "2. Password 12345678",
+      "3. Open 192.168.4.1",
+      "4. Pick WiFi and save",
+      "Enterprise: username + password",
+      "Portal: choose SSID then web login"
+    };
+    for (int i = 0; i < 6; i++) {
+      String text = helpLines[i];
+      int width = 148;
+      if (textNeedsMarquee(text, width)) {
+        lastMarqueeFrame = millis();
+        drawMarqueeText(text, 8, 42 + i * 20 + (i >= 4 ? 4 : 0), width, i >= 4 ? uiText() : uiMuted(), uiBg(), true);
+        return;
+      }
+    }
+    return;
+  }
+
   if (!wifiListOpen) {
+    String label = wifiItemLabel(wifiSelectedIndex);
+    int width = 96;
+    if (textNeedsMarquee(label, width)) {
+      lastMarqueeFrame = millis();
+      int row = wifiSelectedIndex - wifiTopIndex;
+      int y = 42 + row * 23;
+      drawMarqueeText(label, 194, y, width, uiHeaderText(), uiSelect(), true);
+      return;
+    }
+
     String current = "Current: " + (wifiConfig.ssid.length() ? wifiConfig.ssid : String("(not set)"));
-    int width = 146;
+    width = 146;
     if (textNeedsMarquee(current, width)) {
       lastMarqueeFrame = millis();
       drawMarqueeText(current, 8, 108, width, uiText(), uiBg(), true);
@@ -2543,18 +2945,30 @@ void setup()
     if (autoWiFiBaseIndex < 0) autoWiFiBaseIndex = 0;
     autoWiFiAttempt = 0;
     wifiConfig = savedWiFis[autoWiFiBaseIndex];
-    statusLine = "Auto WiFi";
-    connectWiFi(false, true);
+    autoWiFiPending = false;
   } else if (wifiConfig.ssid.length() > 0) {
-    statusLine = "Auto WiFi";
-    connectWiFi(false, true);
+    autoWiFiPending = false;
   }
+  autoWiFiReadyAt = millis() + 12000;
+  statusLine = String("AP: ") + SETUP_AP_SSID;
 }
 
 void loop()
 {
+  startConfigAp();
+  if (autoWiFiPending && !connectingWiFi && millis() >= autoWiFiReadyAt) {
+    autoWiFiPending = false;
+    statusLine = "Auto WiFi";
+    connectWiFi(false, true);
+  }
   dnsServer.processNextRequest();
   server.handleClient();
+  if (portalCheckPending && millis() >= portalCheckReadyAt) {
+    portalCheckPending = false;
+    statusLine = checkUpstreamPortal();
+    wifiUiDirty = true;
+  }
+  updateWiFiScan();
   readEncoder();
   readButton();
   readSerialControls();
@@ -2565,6 +2979,7 @@ void loop()
   updateCo2DogAnimation();
   refreshOneMarket(false);
   updateJw01();
+  refreshWiFiSettingsIfNeeded();
 
   if (redrawRequested) {
     redrawRequested = false;
