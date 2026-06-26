@@ -402,15 +402,15 @@ const char *answerBookEntries[] = {
 constexpr int ANSWER_COUNT = sizeof(answerBookEntries) / sizeof(answerBookEntries[0]);
 
 MarketIndex markets[] = {
-  {"S&P 500", "%5EGSPC", "gb_inx", "%5Espx", 0, 0, false, 0, ""},
-  {"NASDAQ", "%5EIXIC", "gb_ixic", "%5Eixic", 0, 0, false, 0, ""},
-  {"Dow Jones", "%5EDJI", "gb_dji", "%5Edji", 0, 0, false, 0, ""},
-  {"Hang Seng", "%5EHSI", "rt_hkHSI", "%5Ehsi", 0, 0, false, 0, ""},
-  {"Nikkei 225", "%5EN225", "int_nikkei", "%5Enkx", 0, 0, false, 0, ""},
-  {"Shanghai", "000001.SS", "s_sh000001", "000001", 0, 0, false, 0, ""},
-  {"Shenzhen", "399001.SZ", "s_sz399001", "399001", 0, 0, false, 0, ""},
-  {"DAX", "%5EGDAXI", "int_dax", "%5Edax", 0, 0, false, 0, ""},
-  {"FTSE 100", "%5EFTSE", "int_ftse", "%5Eukx", 0, 0, false, 0, ""}
+  {"S&P 500", "%5EGSPC", "gb_inx", "spx", 0, 0, false, 0, ""},
+  {"NASDAQ", "%5EIXIC", "gb_ixic", "comp", 0, 0, false, 0, ""},
+  {"Dow Jones", "%5EDJI", "gb_dji", "dji", 0, 0, false, 0, ""},
+  {"Hang Seng", "%5EHSI", "rt_hkHSI", "hsi", 0, 0, false, 0, ""},
+  {"Nikkei 225", "%5EN225", "int_nikkei", "nkx", 0, 0, false, 0, ""},
+  {"Shanghai", "000001.SS", "s_sh000001", "shc", 0, 0, false, 0, ""},
+  {"Shenzhen", "399001.SZ", "s_sz399001", "szi", 0, 0, false, 0, ""},
+  {"DAX", "%5EGDAXI", "int_dax", "dax", 0, 0, false, 0, ""},
+  {"FTSE 100", "%5EFTSE", "int_ftse", "ukx", 0, 0, false, 0, ""}
 };
 constexpr int MARKET_COUNT = sizeof(markets) / sizeof(markets[0]);
 
@@ -1869,12 +1869,17 @@ bool fetchMarketSina(MarketIndex &market)
 
   WiFiClient client;
   HTTPClient http;
-  String url = "http://hq.sinajs.cn/list=";
+  String url = "http://hq.sinajs.cn/rn=";
+  url += String(millis());
+  url += "&list=";
   url += market.sinaSymbol;
   http.setUserAgent("Mozilla/5.0 ESP32-S3");
   http.setTimeout(5000);
 
   if (!http.begin(client, url)) return false;
+  http.addHeader("Referer", "https://finance.sina.com.cn");
+  http.addHeader("Accept", "*/*");
+  http.addHeader("Accept-Language", "zh-CN,zh;q=0.9");
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     market.error = "S" + String(code);
@@ -1885,7 +1890,10 @@ bool fetchMarketSina(MarketIndex &market)
   String body = http.getString();
   http.end();
   String payload = quotedPayload(body);
-  if (!payload.length()) return false;
+  if (!payload.length()) {
+    market.error = "Sparse";
+    return false;
+  }
 
   float price = csvField(payload, 1).toFloat();
   float pct = csvField(payload, 3).toFloat();
@@ -1893,7 +1901,10 @@ bool fetchMarketSina(MarketIndex &market)
     price = csvField(payload, 3).toFloat();
     pct = csvField(payload, 2).toFloat();
   }
-  if (price == 0) return false;
+  if (price == 0) {
+    market.error = "Sprice";
+    return false;
+  }
   return assignMarketValue(market, price, pct, "S");
 }
 
@@ -1941,10 +1952,16 @@ bool fetchMarket(MarketIndex &market)
   }
 
   market.valid = false;
-  market.error = "no-src";
+  String trace = "";
   if (fetchMarketYahoo(market)) return true;
+  trace += market.error;
+  if (trace.length()) trace += "/";
   if (fetchMarketSina(market)) return true;
+  trace += market.error;
+  if (trace.length()) trace += "/";
   if (fetchMarketStooq(market)) return true;
+  trace += market.error;
+  market.error = trace.length() ? trace : "no-src";
   return false;
 }
 void refreshOneMarket(bool force)
