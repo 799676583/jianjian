@@ -13,6 +13,7 @@
 #error Password Vault requires ARDUINO_USB_MODE=0 for USB CDC and HID composite support.
 #endif
 #include "ChineseFont.h"
+#include "BootImage.h"
 
 #if __has_include(<esp_eap_client.h>)
 #include <esp_eap_client.h>
@@ -517,6 +518,7 @@ void drawCurrentScreen();
 void drawMarketRows();
 void drawCo2Values();
 void drawCo2DogAvatar();
+void drawBootImage();
 void setJw01Baud(uint8_t index);
 void startConfigAp();
 void connectWiFi(bool showSettings = true, bool autoMode = false);
@@ -3025,6 +3027,10 @@ void updateCo2DogAnimation()
   lastDogFrame = millis();
   drawCo2DogAvatar();
 }
+void drawBootImage()
+{
+  tft.pushImage(0, 0, BOOT_IMAGE_W, BOOT_IMAGE_H, bootImageRgb565);
+}
 
 void setup()
 {
@@ -3049,8 +3055,9 @@ void setup()
 
   tft.init();
   tft.setRotation(3);
-  tft.fillScreen(TFT_BLACK);
+  drawBootImage();
   digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+  delay(900);
   loadConfig();
   loadVault();
   startConfigAp();
