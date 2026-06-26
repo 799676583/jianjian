@@ -3021,7 +3021,7 @@ void setup()
   delay(100);
 
   pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+  digitalWrite(TFT_BL, !TFT_BACKLIGHT_ON);
 
   pinMode(ENCODER_CLK_PIN, INPUT_PULLUP);
   pinMode(ENCODER_DT_PIN, INPUT_PULLUP);
@@ -3032,6 +3032,8 @@ void setup()
 
   tft.init();
   tft.setRotation(3);
+  tft.fillScreen(TFT_BLACK);
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
   loadConfig();
   loadVault();
   startConfigAp();
