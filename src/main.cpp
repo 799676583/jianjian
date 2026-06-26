@@ -3029,7 +3029,9 @@ void updateCo2DogAnimation()
 }
 void drawBootImage()
 {
+  tft.setSwapBytes(true);
   tft.pushImage(0, 0, BOOT_IMAGE_W, BOOT_IMAGE_H, bootImageRgb565);
+  tft.setSwapBytes(false);
 }
 
 void setup()
